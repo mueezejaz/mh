@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NexMeet — Video Conference</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link
+    href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=Syne:wght@700;800&display=swap"
+    rel="stylesheet">
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+
+<body>
+
+  <!-- ═══════════════════ LOBBY ═══════════════════ -->
+  <div id="lobby" class="screen active">
+    <div class="lobby-bg">
+      <div class="orb orb-1"></div>
+      <div class="orb orb-2"></div>
+      <div class="orb orb-3"></div>
+    </div>
+    <div class="lobby-card">
+      <div class="brand">
+        <span class="brand-icon">⬡</span>
+        <h1 class="brand-name">NexMeet</h1>
+      </div>
+      <p class="brand-sub">Crystal-clear video meetings. No friction.</p>
+      <div class="tab-bar">
+        <button class="tab active" data-tab="create">Create Room</button>
+        <button class="tab" data-tab="join">Join Room</button>
+      </div>
+      <div id="tab-create" class="tab-panel active">
+        <input id="create-name" class="field" type="text" placeholder="Your name" maxlength="24" />
+        <button id="btn-create" class="btn-primary">Create & Join →</button>
+      </div>
+      <div id="tab-join" class="tab-panel">
+        <input id="join-name" class="field" type="text" placeholder="Your name" maxlength="24" />
+        <input id="join-room" class="field" type="text" placeholder="Room code (e.g. A3F9B2C1)" maxlength="8" />
+        <button id="btn-join" class="btn-primary">Join Room →</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════ PRE-JOIN ═══════════════════ -->
+  <div id="prejoin" class="screen">
+    <div class="lobby-bg">
+      <div class="orb orb-1"></div>
+      <div class="orb orb-2"></div>
+    </div>
+    <div class="prejoin-card">
+      <h2 class="pj-title">Ready to join?</h2>
+      <p id="pj-room-label" class="pj-room"></p>
+
+      <div class="pj-preview-wrap">
+        <video id="preview-video" autoplay muted playsinline></video>
+        <div id="preview-avatar" class="preview-avatar hidden">
+          <span id="preview-avatar-letter">?</span>
+        </div>
+        <div class="pj-cam-off-label hidden" id="pj-cam-off-label">Camera off</div>
+      </div>
+
+      <div class="pj-controls">
+        <button id="pj-mic-btn" class="pj-ctrl-btn active" title="Toggle Mic">
+          <svg viewBox="0 0 24 24">
+            <path d="M12 1a4 4 0 0 1 4 4v7a4 4 0 0 1-8 0V5a4 4 0 0 1 4-4z" />
+            <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+            <line x1="12" y1="19" x2="12" y2="23" />
+            <line x1="8" y1="23" x2="16" y2="23" />
+          </svg>
+          <span>Mic On</span>
+        </button>
+        <button id="pj-cam-btn" class="pj-ctrl-btn active" title="Toggle Camera">
+          <svg viewBox="0 0 24 24">
+            <path d="M23 7l-7 5 7 5V7z" />
+            <rect x="1" y="5" width="15" height="14" rx="2" />
+          </svg>
+          <span>Cam On</span>
+        </button>
+      </div>
+
+      <!-- Mic device selector -->
+      <div class="pj-device-row">
+        <label class="device-label">
+          <svg viewBox="0 0 24 24" width="13" height="13" stroke="currentColor" fill="none" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 1a4 4 0 0 1 4 4v7a4 4 0 0 1-8 0V5a4 4 0 0 1 4-4z" />
+            <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+            <line x1="12" y1="19" x2="12" y2="23" />
+            <line x1="8" y1="23" x2="16" y2="23" />
+          </svg>
+          Microphone
+        </label>
+        <div class="select-wrap">
+          <select id="pj-mic-select" class="device-select">
+            <option>Loading devices…</option>
+          </select>
+          <svg class="select-arrow" viewBox="0 0 24 24">
+            <polyline points="6 9 12 15 18 9" />
+          </svg>
+        </div>
+      </div>
+
+      <div class="pj-actions">
+        <button id="pj-cancel" class="btn-ghost">← Back</button>
+        <button id="pj-enter" class="btn-primary">Enter Room</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════ CONFERENCE ═══════════════════ -->
+  <div id="conference" class="screen">
+
+    <header class="conf-header">
+      <div class="conf-brand">
+        <span class="brand-icon-sm">⬡</span>
+        <span>NexMeet</span>
+      </div>
+      <div class="room-badge">
+        <span id="conf-room-id"></span>
+        <button id="btn-copy" class="copy-btn" title="Copy room code">⎘</button>
+      </div>
+      <div class="conf-time" id="conf-time">00:00</div>
+    </header>
+
+    <main class="video-grid" id="video-grid"></main>
+
+    <footer class="ctrl-bar">
+      <div class="ctrl-group">
+
+        <!-- Mic + picker chevron combo -->
+        <div class="ctrl-combo">
+          <button id="btn-mic" class="ctrl-btn active" title="Toggle Microphone">
+            <svg class="ic-mic" viewBox="0 0 24 24">
+              <path d="M12 1a4 4 0 0 1 4 4v7a4 4 0 0 1-8 0V5a4 4 0 0 1 4-4z" />
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+              <line x1="12" y1="19" x2="12" y2="23" />
+              <line x1="8" y1="23" x2="16" y2="23" />
+            </svg>
+            <svg class="ic-mic-off hidden" viewBox="0 0 24 24">
+              <line x1="1" y1="1" x2="23" y2="23" />
+              <path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V5a3 3 0 0 0-5.94-.6" />
+              <path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23" />
+              <line x1="12" y1="19" x2="12" y2="23" />
+              <line x1="8" y1="23" x2="16" y2="23" />
+            </svg>
+            <span class="ctrl-label" id="mic-label">Mute</span>
+          </button>
+          <button id="btn-mic-picker" class="ctrl-chevron" title="Select microphone">
+            <svg viewBox="0 0 24 24">
+              <polyline points="6 9 12 15 18 9" />
+            </svg>
+          </button>
+        </div>
+
+        <!-- Camera -->
+        <button id="btn-cam" class="ctrl-btn active" title="Toggle Camera">
+          <svg class="ic-cam" viewBox="0 0 24 24">
+            <path d="M23 7l-7 5 7 5V7z" />
+            <rect x="1" y="5" width="15" height="14" rx="2" />
+          </svg>
+          <svg class="ic-cam-off hidden" viewBox="0 0 24 24">
+            <line x1="1" y1="1" x2="23" y2="23" />
+            <path d="M21 21H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h3m3-3h6l2 3h1a2 2 0 0 1 2 2v9.34" />
+            <path d="M16 11.37A4 4 0 1 1 12.63 8" />
+          </svg>
+          <span class="ctrl-label" id="cam-label">Stop Video</span>
+        </button>
+
+        <!-- Screen Share -->
+        <button id="btn-share" class="ctrl-btn" title="Share Screen">
+          <svg class="ic-share" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <rect x="2" y="3" width="20" height="13" rx="2" />
+            <path d="M8 21h8M12 17v4" />
+            <polyline points="8 9 12 6 16 9" />
+            <line x1="12" y1="6" x2="12" y2="14" />
+          </svg>
+          <svg class="ic-share-stop hidden" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <rect x="2" y="3" width="20" height="13" rx="2" />
+            <path d="M8 21h8M12 17v4" />
+            <line x1="4" y1="6" x2="20" y2="18" />
+          </svg>
+          <span class="ctrl-label" id="share-label">Share</span>
+        </button>
+      </div>
+
+      <button id="btn-leave" class="ctrl-btn leave">
+        <svg viewBox="0 0 24 24">
+          <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+          <polyline points="16 17 21 12 16 7" />
+          <line x1="21" y1="12" x2="9" y2="12" />
+        </svg>
+        <span class="ctrl-label">Leave</span>
+      </button>
+    </footer>
+
+    <!-- Mic picker popup (floats above ctrl-bar) -->
+    <div id="mic-picker" class="mic-picker hidden">
+      <div class="mic-picker-header">
+        <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" fill="none" stroke-width="2"
+          stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 1a4 4 0 0 1 4 4v7a4 4 0 0 1-8 0V5a4 4 0 0 1 4-4z" />
+          <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+          <line x1="12" y1="19" x2="12" y2="23" />
+          <line x1="8" y1="23" x2="16" y2="23" />
+        </svg>
+        Select Microphone
+      </div>
+      <ul id="mic-list" class="mic-list"></ul>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div id="toast" class="toast"></div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="js/app.js"></script>
+</body>
+
+</html>
