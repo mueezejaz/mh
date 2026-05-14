@@ -116,7 +116,6 @@ async function startPreviewStream(micDeviceId = null) {
 // ── Enumerate audio input devices ──
 async function populateMicDevices(selectId) {
   try {
-    // Need permission first (already asked in getUserMedia above)
     const devices = await navigator.mediaDevices.enumerateDevices();
     state.audioDevices = devices.filter(d => d.kind === 'audioinput');
 
@@ -137,7 +136,6 @@ async function populateMicDevices(selectId) {
       sel.appendChild(opt);
     });
 
-    // Default to first if none selected
     if (!state.selectedMicId) {
       state.selectedMicId = state.audioDevices[0]?.deviceId || null;
     }
@@ -183,7 +181,6 @@ $('pj-cam-btn').addEventListener('click', () => {
   updatePrejoinUI();
 });
 
-// Pre-join mic selector change
 $('pj-mic-select').addEventListener('change', async (e) => {
   state.selectedMicId = e.target.value;
   await startPreviewStream(state.selectedMicId);
@@ -233,36 +230,62 @@ async function joinConference() {
 // ══════════════════════════════════════════
 // SIGNALING
 // ══════════════════════════════════════════
+
+// FIX 1: New joiner is always the initiator — sends offers to all existing peers.
+// Existing peers do NOT call createPeerConnection here; they wait for the 'offer' event.
 socket.on('room-peers', async ({ peers }) => {
   for (const peer of peers) {
     state.peerNames[peer.id] = peer.name;
     state.peerMedia[peer.id] = { micOn: peer.micOn, cameraOn: peer.cameraOn };
+    // New joiner sends the offer to each existing peer (isInitiator = true)
     await createPeerConnection(peer.id, true);
   }
 });
 
-socket.on('peer-joined', async ({ peerId, name, micOn, cameraOn }) => {
+// FIX 2: When an existing peer is notified of the new joiner, they do NOT
+// create a peer connection here. They wait for the offer that the new joiner
+// will send. Creating a PC here caused offer/answer glare (both sides
+// simultaneously trying to negotiate) which broke the connection.
+socket.on('peer-joined', ({ peerId, name, micOn, cameraOn }) => {
   state.peerNames[peerId] = name;
   state.peerMedia[peerId] = { micOn, cameraOn };
   showToast(`${name} joined`);
-  await createPeerConnection(peerId, false);
+  // DO NOT call createPeerConnection here — the new peer will send us an offer,
+  // and we'll create the PC in the 'offer' handler below.
 });
 
+// FIX 3: The 'offer' handler is responsible for creating the PC on the
+// receiving side. It must correctly set the remote description, create an
+// answer, and set the local description before sending the answer back.
 socket.on('offer', async ({ fromId, fromName, offer }) => {
+  // Create PC for this peer if we don't have one yet (we're the non-initiator)
   if (!state.peers[fromId]) {
     state.peerNames[fromId] = fromName;
+    // isInitiator = false — we receive the offer, we don't send one
     await createPeerConnection(fromId, false);
   }
   const pc = state.peers[fromId];
-  await pc.setRemoteDescription(new RTCSessionDescription(offer));
-  const answer = await pc.createAnswer();
-  await pc.setLocalDescription(answer);
-  socket.emit('answer', { targetId: fromId, answer });
+  try {
+    await pc.setRemoteDescription(new RTCSessionDescription(offer));
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    socket.emit('answer', { targetId: fromId, answer });
+  } catch (e) {
+    console.error('Error handling offer:', e);
+  }
 });
 
 socket.on('answer', async ({ fromId, answer }) => {
   const pc = state.peers[fromId];
-  if (pc) await pc.setRemoteDescription(new RTCSessionDescription(answer));
+  if (pc) {
+    try {
+      // Guard against setting remote description when already have one
+      if (pc.signalingState !== 'have-local-offer') return;
+      await pc.setRemoteDescription(new RTCSessionDescription(answer));
+    } catch (e) {
+      console.error('Error handling answer:', e);
+    }
+  }
 });
 
 socket.on('ice-candidate', async ({ fromId, candidate }) => {
@@ -286,52 +309,88 @@ socket.on('peer-left', ({ peerId }) => {
 // RTCPeerConnection
 // ══════════════════════════════════════════
 async function createPeerConnection(peerId, isInitiator) {
+  // Don't create duplicate connections
+  if (state.peers[peerId]) return state.peers[peerId];
+
   const pc = new RTCPeerConnection(ICE_CONFIG);
   state.peers[peerId] = pc;
 
-  // Add all local tracks (camera + possibly screen)
-  const streams = [state.localStream, state.screenStream].filter(Boolean);
-  streams.forEach(stream => {
-    stream.getTracks().forEach(track => pc.addTrack(track, stream));
-  });
+  // Add all local tracks
+  if (state.localStream) {
+    state.localStream.getTracks().forEach(track => {
+      pc.addTrack(track, state.localStream);
+    });
+  }
+  // Also add screen share tracks if active
+  if (state.screenStream) {
+    state.screenStream.getTracks().forEach(track => {
+      pc.addTrack(track, state.screenStream);
+    });
+  }
 
   pc.onicecandidate = ({ candidate }) => {
     if (candidate) socket.emit('ice-candidate', { targetId: peerId, candidate });
   };
 
-  pc.ontrack = ({ streams }) => {
+  // FIX 4: ontrack — always create the tile if missing, then attach stream.
+  // Previously the tile was sometimes added before the stream was ready,
+  // resulting in a blank video element.
+  pc.ontrack = ({ track, streams }) => {
     const stream = streams[0];
+    if (!stream) return;
+
     const name = state.peerNames[peerId] || 'Peer';
     const media = state.peerMedia[peerId] || { micOn: true, cameraOn: true };
 
-    let tile = document.getElementById(`tile-${peerId}`);
+    // Determine tile id — video track = camera tile, separate stream = screen tile
+    const tileId = peerId;
+
+    let tile = document.getElementById(`tile-${tileId}`);
     if (!tile) {
-      addVideoTile(peerId, name, null, false);
-      tile = document.getElementById(`tile-${peerId}`);
+      addVideoTile(tileId, name, null, false);
+      tile = document.getElementById(`tile-${tileId}`);
     }
+
     const video = tile.querySelector('video');
     if (video) {
-      video.srcObject = stream;
+      // If srcObject already set to this stream, don't reassign (avoids flicker)
+      if (video.srcObject !== stream) {
+        video.srcObject = stream;
+      }
       video.play().catch(() => { });
     }
-    updateTileBadges(peerId, media.micOn, media.cameraOn);
+
+    updateTileBadges(tileId, media.micOn, media.cameraOn);
     updateGridClass();
   };
 
   pc.onconnectionstatechange = () => {
-    if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) removePeer(peerId);
+    console.log(`Peer ${peerId} connection state: ${pc.connectionState}`);
+    if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) {
+      removePeer(peerId);
+    }
   };
 
+  // FIX 5: Only the initiator creates and sends the offer.
+  // The non-initiator waits for the offer via the socket event.
   if (isInitiator) {
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    socket.emit('offer', { targetId: peerId, offer });
+    try {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      socket.emit('offer', { targetId: peerId, offer });
+    } catch (e) {
+      console.error('Error creating offer:', e);
+    }
   }
+
   return pc;
 }
 
 function removePeer(peerId) {
-  if (state.peers[peerId]) { state.peers[peerId].close(); delete state.peers[peerId]; }
+  if (state.peers[peerId]) {
+    state.peers[peerId].close();
+    delete state.peers[peerId];
+  }
   delete state.peerNames[peerId];
   delete state.peerMedia[peerId];
   const tile = document.getElementById(`tile-${peerId}`);
@@ -344,6 +403,10 @@ function removePeer(peerId) {
 // ══════════════════════════════════════════
 function addVideoTile(id, name, stream, isLocal, isScreen = false) {
   const grid = $('video-grid');
+
+  // Don't add duplicate tiles
+  if (document.getElementById(`tile-${id}`)) return;
+
   const tile = document.createElement('div');
   const cls = ['video-tile'];
   if (isLocal && !isScreen) cls.push('local');
@@ -374,7 +437,6 @@ function addVideoTile(id, name, stream, isLocal, isScreen = false) {
   if (stream) {
     video.srcObject = stream;
     video.play().catch(() => { });
-    if (isLocal && !isScreen) updateLocalTileAvatar(tile, state.cameraOn);
   }
 
   grid.appendChild(tile);
@@ -394,9 +456,8 @@ function updateLocalTileAvatar(tile, cameraOn) {
 function updateTileBadges(id, micOn, cameraOn) {
   const badge = $(`badge-${id}`);
   if (!badge) return;
-  // Preserve screen badge if present
   const screenBadge = badge.querySelector('.screen-badge');
-  badge.innerHTML = screenBadge ? '' : '';
+  badge.innerHTML = '';
   if (screenBadge) badge.appendChild(screenBadge);
 
   if (!micOn) {
@@ -492,13 +553,11 @@ $('btn-mic-picker').addEventListener('click', async (e) => {
     return;
   }
 
-  // Refresh device list each time
   await refreshMicPickerList();
   picker.classList.remove('hidden');
   chevron.classList.add('open');
 });
 
-// Close mic picker when clicking elsewhere
 document.addEventListener('click', (e) => {
   const picker = $('mic-picker');
   const btn = $('btn-mic-picker');
@@ -541,7 +600,6 @@ async function refreshMicPickerList() {
 
 async function selectMicDevice(deviceId) {
   if (deviceId === state.selectedMicId) {
-    // Just close the picker
     $('mic-picker').classList.add('hidden');
     $('btn-mic-picker').classList.remove('open');
     return;
@@ -551,7 +609,6 @@ async function selectMicDevice(deviceId) {
   showToast('Switching microphone…');
 
   try {
-    // Get new audio stream with selected device
     const newAudioStream = await navigator.mediaDevices.getUserMedia({
       audio: { deviceId: { exact: deviceId } },
       video: false,
@@ -560,10 +617,8 @@ async function selectMicDevice(deviceId) {
     const newAudioTrack = newAudioStream.getAudioTracks()[0];
     if (!newAudioTrack) throw new Error('No audio track');
 
-    // Apply enabled state
     newAudioTrack.enabled = state.micOn;
 
-    // Replace the audio track in localStream
     if (state.localStream) {
       const oldTracks = state.localStream.getAudioTracks();
       oldTracks.forEach(t => { state.localStream.removeTrack(t); t.stop(); });
@@ -572,7 +627,6 @@ async function selectMicDevice(deviceId) {
       state.localStream = newAudioStream;
     }
 
-    // Replace the sender track in all peer connections
     for (const pc of Object.values(state.peers)) {
       const sender = pc.getSenders().find(s => s.track?.kind === 'audio');
       if (sender) {
@@ -586,7 +640,6 @@ async function selectMicDevice(deviceId) {
     showToast('Failed to switch microphone: ' + e.message);
   }
 
-  // Refresh the picker list to show new selection
   await refreshMicPickerList();
   $('mic-picker').classList.add('hidden');
   $('btn-mic-picker').classList.remove('open');
@@ -627,19 +680,20 @@ async function startScreenShare() {
 
     const screenTrack = screenStream.getVideoTracks()[0];
 
-    // Add screen share tile locally
     addVideoTile('screen-local', `${state.userName}'s Screen`, screenStream, true, true);
 
-    // Add the screen track to all existing peer connections
-    for (const pc of Object.values(state.peers)) {
+    // FIX 6: Capture peerId in the loop variable to avoid closure bug
+    for (const [peerId, pc] of Object.entries(state.peers)) {
       pc.addTrack(screenTrack, screenStream);
-      // Renegotiate
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      socket.emit('offer', { targetId: Object.keys(state.peers).find(k => state.peers[k] === pc), offer });
+      try {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        socket.emit('offer', { targetId: peerId, offer });
+      } catch (e) {
+        console.error('Screen share renegotiation error for peer', peerId, e);
+      }
     }
 
-    // When user stops from browser UI
     screenTrack.onended = () => stopScreenShare();
 
     updateShareButton(true);
@@ -655,7 +709,6 @@ async function stopScreenShare() {
   state.screenStream = null;
   state.isSharing = false;
 
-  // Remove screen tile
   const tile = $('tile-screen-local');
   if (tile) tile.remove();
   updateGridClass();
