@@ -739,84 +739,69 @@ body {
 }
 
 /* ══════════════════════════════════════════
-   FULLSCREEN — ASPECT RATIO PRESERVED
-   Fix for mobile: use 100dvh (dynamic viewport
-   height) so the tile covers the actual visible
-   area, not the full viewport including browser
-   chrome. object-fit: contain prevents any
-   cropping — video letterboxes instead.
+   FULLSCREEN FIX — MOBILE SAFE
+   Prevent top/bottom cropping on phones
    ══════════════════════════════════════════ */
 
 .video-tile:fullscreen,
 .video-tile:-webkit-full-screen,
-.video-tile:-moz-full-screen,
-.video-tile:-ms-fullscreen,
 .video-tile.fullscreen-css {
   position: fixed !important;
   inset: 0 !important;
   z-index: 9999 !important;
-  border-radius: 0 !important;
-  border: none !important;
-  background: #000 !important;
-  max-width: none !important;
-  max-height: none !important;
-  margin: 0 !important;
-  padding: 0 !important;
-  /* Explicit size: dvh accounts for mobile browser chrome */
+
   width: 100vw !important;
-  height: 100vh !important;
   height: 100dvh !important;
-  /* Flex-center the video so it letterboxes/pillarboxes correctly */
+
+  background: #000 !important;
+  border: none !important;
+  border-radius: 0 !important;
+  overflow: hidden !important;
+
   display: flex !important;
   align-items: center !important;
   justify-content: center !important;
-  overflow: hidden !important;
 }
 
-/* Video fills the flex container but never gets cropped */
+/* IMPORTANT FIX */
 .video-tile:fullscreen video,
 .video-tile:-webkit-full-screen video,
-.video-tile:-moz-full-screen video,
-.video-tile:-ms-fullscreen video,
 .video-tile.fullscreen-css video {
-  width: 100% !important;
-  height: 100% !important;
+  /* remove forced stretching */
+  width: auto !important;
+  height: auto !important;
+
+  /* fit safely inside screen */
   max-width: 100vw !important;
-  max-height: 100vh !important;
   max-height: 100dvh !important;
-  /* contain = never crop, always show the full frame */
+
   object-fit: contain !important;
-  flex-shrink: 1 !important;
+
+  display: block !important;
   margin: auto !important;
   background: #000 !important;
-  /* Mirror must be removed in fullscreen so faces look natural */
-  transform: none !important;
+
+  /* smoother rendering */
+  image-rendering: auto !important;
 }
 
-/* Local tile: keep the mirror flip in fullscreen too (feels natural) */
+/* keep mirror for self cam */
 .video-tile.local:fullscreen video,
 .video-tile.local:-webkit-full-screen video,
-.video-tile.local:-moz-full-screen video,
-.video-tile.local:-ms-fullscreen video,
 .video-tile.local.fullscreen-css video {
   transform: scaleX(-1) !important;
 }
 
-/* Screen share — contain is already correct */
+/* screen share should never mirror */
 .video-tile.screen-tile:fullscreen video,
 .video-tile.screen-tile:-webkit-full-screen video,
-.video-tile.screen-tile:-moz-full-screen video,
-.video-tile.screen-tile:-ms-fullscreen video,
 .video-tile.screen-tile.fullscreen-css video {
-  object-fit: contain !important;
   transform: none !important;
 }
 
-/* Tile overlay stays pinned to the bottom in fullscreen */
+/* overlays */
 .video-tile:fullscreen .tile-overlay,
 .video-tile:-webkit-full-screen .tile-overlay,
-.video-tile:-moz-full-screen .tile-overlay,
-.video-tile:-ms-fullscreen .tile-overlay,
 .video-tile.fullscreen-css .tile-overlay {
   position: absolute !important;
   bottom: 0 !important;
@@ -825,17 +810,13 @@ body {
   z-index: 10000 !important;
 }
 
-/* Tile actions stay pinned to top-right in fullscreen */
 .video-tile:fullscreen .tile-actions,
 .video-tile:-webkit-full-screen .tile-actions,
-.video-tile:-moz-full-screen .tile-actions,
-.video-tile:-ms-fullscreen .tile-actions,
 .video-tile.fullscreen-css .tile-actions {
   position: absolute !important;
   top: 8px !important;
   right: 8px !important;
   z-index: 10000 !important;
-  /* Always show actions in fullscreen — no hover needed on mobile */
   opacity: 1 !important;
 }
 
