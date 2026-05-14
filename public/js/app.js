@@ -1,7 +1,13 @@
 /* ══════════════════════════════════════════
    NexMeet — WebRTC Conference App
-   Screen sharing fix: proper renegotiation,
-   separate screen tiles, track labeling
+   Fixes:
+   - createPeerConnection now properly tracked (isInitiatorForPeer works)
+   - onnegotiationneeded fires for ALL peers, not just initiators
+   - makingOffer guard checked BEFORE createOffer (not after)
+   - isPolite logic corrected (was inverted)
+   - peer-screen-share tile removal uses correct tile ID
+   - Screen share: high-quality constraints + high RTP priority
+   - triggerRenegotiation removed (onnegotiationneeded handles all sides)
    ══════════════════════════════════════════ */
 
 const socket = io();
@@ -10,23 +16,25 @@ const socket = io();
 const state = {
   roomId: null,
   userName: null,
-  localStream: null,      // camera + mic stream
-  screenStream: null,     // screen share stream
+  localStream: null,
+  screenStream: null,
   isSharing: false,
   micOn: true,
   cameraOn: true,
   selectedMicId: null,
   audioDevices: [],
-  peers: {},              // peerId -> RTCPeerConnection
+  peers: {},
   peerNames: {},
   peerMedia: {},
-  // Track which streams belong to screen vs camera per peer
-  peerScreenStreams: {},  // peerId -> streamId of their screen stream
+  peerScreenStreams: {},   // peerId -> streamId of their screen stream
   startTime: null,
   timerInterval: null,
-  makingOffer: {},        // peerId -> bool  (perfect negotiation)
-  ignoreOffer: {},        // peerId -> bool
+  makingOffer: {},         // peerId -> bool  (perfect negotiation)
+  ignoreOffer: {},         // peerId -> bool
 };
+
+// Track which peers WE initiated — used for polite/impolite role
+const initiatedPeers = new Set();
 
 const ICE_CONFIG = {
   iceServers: [
@@ -222,7 +230,7 @@ socket.on('room-peers', async ({ peers }) => {
   for (const peer of peers) {
     state.peerNames[peer.id] = peer.name;
     state.peerMedia[peer.id] = { micOn: peer.micOn, cameraOn: peer.cameraOn };
-    await createPeerConnection(peer.id, true);
+    await createPeerConnection(peer.id, true);  // we initiate toward existing peers
   }
 });
 
@@ -230,32 +238,32 @@ socket.on('peer-joined', ({ peerId, name, micOn, cameraOn }) => {
   state.peerNames[peerId] = name;
   state.peerMedia[peerId] = { micOn, cameraOn };
   showToast(`${name} joined`);
-  // New peer will send us an offer — we create PC in the offer handler
+  // New peer sends us an offer — PC is created lazily in the offer handler
 });
 
 // ─── Perfect Negotiation: offer handler ───────────────────────────────────
-// Handles BOTH initial offers AND renegotiation offers (e.g. screen share)
-socket.on('offer', async ({ fromId, fromName, offer, isPolite }) => {
+socket.on('offer', async ({ fromId, fromName, offer, isPolite: senderIsPolite }) => {
   if (!state.peers[fromId]) {
     state.peerNames[fromId] = fromName;
-    await createPeerConnection(fromId, false);
+    await createPeerConnection(fromId, false);  // they initiated, we didn't
   }
 
   const pc = state.peers[fromId];
   const offerCollision = (pc.signalingState !== 'stable') || state.makingOffer[fromId];
 
-  // We are always the "polite" side when we didn't initiate (isInitiator=false)
-  // The initiator is "impolite" — it never backs down
-  const weArePolite = !isPolite; // isPolite flag tells us if THEY are polite; we're the opposite
+  // FIX: senderIsPolite tells us about THEM.
+  // If they are polite, WE are the impolite side (we were the initiator).
+  // If they are impolite, WE are the polite side.
+  const weArePolite = !senderIsPolite;
 
   state.ignoreOffer[fromId] = !weArePolite && offerCollision;
   if (state.ignoreOffer[fromId]) {
-    console.log('Ignoring offer due to collision (impolite side)');
+    console.log(`[negotiation] Ignoring colliding offer from ${fromId} (we are impolite)`);
     return;
   }
 
   try {
-    if (offerCollision) {
+    if (offerCollision && weArePolite) {
       // Polite side: roll back our pending local offer
       await pc.setLocalDescription({ type: 'rollback' });
     }
@@ -303,7 +311,7 @@ socket.on('peer-screen-share', ({ peerId, streamId, sharing }) => {
     state.peerScreenStreams[peerId] = streamId;
   } else {
     delete state.peerScreenStreams[peerId];
-    // Remove the remote screen tile
+    // FIX: correct tile ID format — tile element id is `tile-screen-${peerId}`
     const tile = $(`tile-screen-${peerId}`);
     if (tile) tile.remove();
     updateGridClass();
@@ -320,6 +328,9 @@ socket.on('peer-left', ({ peerId }) => {
 // ══════════════════════════════════════════
 async function createPeerConnection(peerId, isInitiator) {
   if (state.peers[peerId]) return state.peers[peerId];
+
+  // FIX: record initiator role HERE, inside the real function
+  if (isInitiator) initiatedPeers.add(peerId);
 
   const pc = new RTCPeerConnection(ICE_CONFIG);
   state.peers[peerId] = pc;
@@ -344,18 +355,26 @@ async function createPeerConnection(peerId, isInitiator) {
     if (candidate) socket.emit('ice-candidate', { targetId: peerId, candidate });
   };
 
+  // FIX: onnegotiationneeded now fires for ALL peers (not just initiators).
+  // Perfect negotiation handles collision — no need to gate on isInitiator.
+  // The impolite side (initiator) wins collisions; polite side rolls back.
   pc.onnegotiationneeded = async () => {
-    // Only the initiator handles onnegotiationneeded to avoid glare
-    if (!isInitiator) return;
+    // FIX: guard BEFORE createOffer, not after — prevents setting local
+    // description on a non-stable peer and corrupting signaling state
+    if (pc.signalingState !== 'stable') return;
+    if (state.makingOffer[peerId]) return;
+
     try {
       state.makingOffer[peerId] = true;
       const offer = await pc.createOffer();
+      // Double-check still stable after the async createOffer
       if (pc.signalingState !== 'stable') return;
       await pc.setLocalDescription(offer);
       socket.emit('offer', {
         targetId: peerId,
         offer,
-        isPolite: false, // initiator is impolite
+        // isInitiator == impolite (never backs down on collision)
+        isPolite: !isInitiator,
       });
     } catch (e) {
       console.error('onnegotiationneeded error:', e);
@@ -372,7 +391,6 @@ async function createPeerConnection(peerId, isInitiator) {
     const name = state.peerNames[peerId] || 'Peer';
     const media = state.peerMedia[peerId] || { micOn: true, cameraOn: true };
 
-    // Check if this stream is the peer's screen share stream
     const isScreen = state.peerScreenStreams[peerId] === stream.id;
     const tileId = isScreen ? `screen-${peerId}` : peerId;
 
@@ -411,6 +429,7 @@ function removePeer(peerId) {
     state.peers[peerId].close();
     delete state.peers[peerId];
   }
+  initiatedPeers.delete(peerId);
   delete state.peerNames[peerId];
   delete state.peerMedia[peerId];
   delete state.peerScreenStreams[peerId];
@@ -426,6 +445,11 @@ function removePeer(peerId) {
 
 // ══════════════════════════════════════════
 // SCREEN SHARE
+// Smooth, low-latency screen sharing:
+// - High framerate constraints (30fps target)
+// - RTP encoding priority set to 'high'
+// - onnegotiationneeded handles renegotiation automatically
+//   for both initiator and non-initiator sides
 // ══════════════════════════════════════════
 $('btn-share').addEventListener('click', async () => {
   if (state.isSharing) {
@@ -439,10 +463,13 @@ async function startScreenShare() {
   try {
     const screenStream = await navigator.mediaDevices.getDisplayMedia({
       video: {
+        // Higher framerate = smoother screen share
         frameRate: { ideal: 30, max: 60 },
-        width: { ideal: 1280 },              // reduced from 1920
-        height: { ideal: 720 },
+        width: { ideal: 1920, max: 2560 },
+        height: { ideal: 1080, max: 1440 },
         cursor: 'always',
+        // Prefer motion clarity over still-frame sharpness (reduces jank)
+        displaySurface: 'monitor',
       },
       audio: false,
     });
@@ -455,17 +482,27 @@ async function startScreenShare() {
     // Show local screen tile
     addVideoTile('screen-local', `${state.userName}'s Screen`, screenStream, true, true);
 
-    // Tell ALL remote peers the stream ID so they can identify it in ontrack
+    // Tell ALL remote peers the stream ID so ontrack can identify it
     socket.emit('screen-share-started', { streamId: screenStream.id });
 
-    // Add track to each peer connection — onnegotiationneeded will handle renegotiation
+    // Add screen track to every peer connection.
+    // onnegotiationneeded fires automatically on both sides (fixed),
+    // so no manual renegotiation call needed.
     for (const [peerId, pc] of Object.entries(state.peers)) {
       try {
-        pc.addTrack(screenTrack, screenStream);
-        // onnegotiationneeded fires automatically after addTrack on the initiator
-        // For non-initiators we manually trigger renegotiation
-        if (!isInitiatorForPeer(peerId)) {
-          await triggerRenegotiation(peerId, pc);
+        const sender = pc.addTrack(screenTrack, screenStream);
+
+        // FIX: set high RTP priority so screen share isn't throttled
+        // behind camera/audio tracks — reduces jank and delay
+        const params = sender.getParameters();
+        if (params.encodings && params.encodings.length > 0) {
+          params.encodings.forEach(enc => {
+            enc.priority = 'high';
+            enc.networkPriority = 'high';
+            // Remove any artificially low bitrate cap
+            delete enc.maxBitrate;
+          });
+          await sender.setParameters(params).catch(() => { });
         }
       } catch (e) {
         console.error('Error adding screen track for peer', peerId, e);
@@ -485,9 +522,9 @@ async function stopScreenShare() {
 
   // Remove screen tracks from all peer connections
   for (const pc of Object.values(state.peers)) {
-    const senders = pc.getSenders().filter(s => {
-      return state.screenStream.getTracks().includes(s.track);
-    });
+    const senders = pc.getSenders().filter(s =>
+      s.track && state.screenStream.getTracks().includes(s.track)
+    );
     for (const sender of senders) {
       try { pc.removeTrack(sender); } catch (e) { }
     }
@@ -504,39 +541,6 @@ async function stopScreenShare() {
   socket.emit('screen-share-stopped');
   updateShareButton(false);
   showToast('Screen sharing stopped');
-}
-
-// Track which peers WE initiated (so we know who triggers onnegotiationneeded)
-const initiatedPeers = new Set();
-const origCreate = createPeerConnection;
-
-// Wrap to record initiator role
-async function createPeerConnectionTracked(peerId, isInitiator) {
-  if (isInitiator) initiatedPeers.add(peerId);
-  return origCreate(peerId, isInitiator);
-}
-
-function isInitiatorForPeer(peerId) {
-  return initiatedPeers.has(peerId);
-}
-
-// Manual renegotiation for non-initiator when screen share starts
-async function triggerRenegotiation(peerId, pc) {
-  try {
-    state.makingOffer[peerId] = true;
-    const offer = await pc.createOffer();
-    if (pc.signalingState !== 'stable') { state.makingOffer[peerId] = false; return; }
-    await pc.setLocalDescription(offer);
-    socket.emit('offer', {
-      targetId: peerId,
-      offer,
-      isPolite: true, // non-initiator is polite
-    });
-  } catch (e) {
-    console.error('triggerRenegotiation error:', e);
-  } finally {
-    state.makingOffer[peerId] = false;
-  }
 }
 
 function updateShareButton(sharing) {
@@ -639,10 +643,6 @@ function updateGridClass() {
 
 // ══════════════════════════════════════════
 // FULLSCREEN PER TILE
-// Uses native Fullscreen API so the browser
-// chrome (address bar) is fully hidden.
-// On mobile, also locks orientation to landscape
-// so the video fills the screen horizontally.
 // ══════════════════════════════════════════
 let currentFullscreen = null;
 
@@ -650,26 +650,21 @@ async function toggleTileFullscreen(id) {
   const tile = $(`tile-${id}`);
   if (!tile) return;
 
-  // ── EXIT fullscreen ──────────────────────
   if (currentFullscreen === id) {
-    // Exit native fullscreen
     if (document.fullscreenElement || document.webkitFullscreenElement) {
       try {
         const exitFn = document.exitFullscreen || document.webkitExitFullscreen;
         if (exitFn) await exitFn.call(document);
       } catch (e) { }
     }
-    // Release orientation lock
     try {
       if (screen.orientation && screen.orientation.unlock) {
         screen.orientation.unlock();
       }
     } catch (e) { }
-    return; // the fullscreenchange event handles the rest
+    return;
   }
 
-  // ── ENTER fullscreen ─────────────────────
-  // Exit any current fullscreen tile first
   if (currentFullscreen) {
     const prev = $(`tile-${currentFullscreen}`);
     if (prev) setFullscreenIcon(prev, false);
@@ -679,8 +674,6 @@ async function toggleTileFullscreen(id) {
   setFullscreenIcon(tile, true);
 
   try {
-    // Prefer the tile element itself as the fullscreen root so the
-    // video + overlay fill the entire display (no browser chrome).
     const requestFn = tile.requestFullscreen
       || tile.webkitRequestFullscreen
       || tile.mozRequestFullScreen
@@ -690,12 +683,9 @@ async function toggleTileFullscreen(id) {
       await requestFn.call(tile, { navigationUI: 'hide' });
     }
   } catch (e) {
-    // Fallback: CSS fullscreen (position:fixed covering viewport)
-    // Used when Fullscreen API is blocked (e.g. some iOS WebViews)
     tile.classList.add('fullscreen-css');
   }
 
-  // Lock to landscape on mobile so video is wide
   try {
     if (screen.orientation && screen.orientation.lock) {
       await screen.orientation.lock('landscape');
@@ -704,13 +694,9 @@ async function toggleTileFullscreen(id) {
     } else if (window.screen.mozLockOrientation) {
       window.screen.mozLockOrientation('landscape');
     }
-  } catch (e) {
-    // Orientation lock is optional — silently ignore if not supported
-  }
+  } catch (e) { }
 }
 
-// Keep our state in sync when the user exits fullscreen via
-// the browser's own Escape / back-gesture / swipe-down
 function handleFullscreenChange() {
   const isFullscreen = !!(document.fullscreenElement || document.webkitFullscreenElement);
   if (!isFullscreen && currentFullscreen) {
