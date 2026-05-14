@@ -4,7 +4,17 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>NexMeet — Video Conference</title>
+  <!-- Enable fullscreen / standalone mode on iOS -->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+
+  <!-- Enable fullscreen on Android Chrome -->
+  <meta name="mobile-web-app-capable" content="yes">
+
+  <!-- Prevent double-tap zoom and ensure correct touch sizing -->
+  <meta name="viewport"
+    content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>mh— Video Conference</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link
     href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=Syne:wght@700;800&display=swap"
@@ -24,7 +34,7 @@
     <div class="lobby-card">
       <div class="brand">
         <span class="brand-icon">⬡</span>
-        <h1 class="brand-name">NexMeet</h1>
+        <h1 class="brand-name">mh</h1>
       </div>
       <p class="brand-sub">Crystal-clear video meetings. No friction.</p>
       <div class="tab-bar">
