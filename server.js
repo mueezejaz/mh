@@ -12,35 +12,29 @@ const io = new Server(server, {
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Serve index for any route (SPA-style)
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// Generate a new room ID
 app.get('/create-room', (req, res) => {
   const roomId = uuidv4().slice(0, 8).toUpperCase();
   res.json({ roomId });
 });
 
-// Track rooms and their participants
 const rooms = {}; // roomId -> { socketId -> { id, name, micOn, cameraOn } }
 
 io.on('connection', (socket) => {
   console.log(`[+] Connected: ${socket.id}`);
 
-  // User joins a room
   socket.on('join-room', ({ roomId, userName, micOn, cameraOn }) => {
     socket.join(roomId);
 
     if (!rooms[roomId]) rooms[roomId] = {};
     rooms[roomId][socket.id] = { id: socket.id, name: userName, micOn, cameraOn };
 
-    // Tell the new user about existing participants
     const existingPeers = Object.values(rooms[roomId]).filter(p => p.id !== socket.id);
     socket.emit('room-peers', { peers: existingPeers });
 
-    // Tell existing peers about the new user
     socket.to(roomId).emit('peer-joined', {
       peerId: socket.id,
       name: userName,
@@ -53,16 +47,15 @@ io.on('connection', (socket) => {
     console.log(`[~] ${userName} joined room ${roomId}`);
   });
 
-  // WebRTC signaling: offer
-  socket.on('offer', ({ targetId, offer }) => {
+  socket.on('offer', ({ targetId, offer, isPolite }) => {
     io.to(targetId).emit('offer', {
       fromId: socket.id,
       fromName: socket.userName,
-      offer
+      offer,
+      isPolite   // ← forward the polite flag the client sends
     });
   });
 
-  // WebRTC signaling: answer
   socket.on('answer', ({ targetId, answer }) => {
     io.to(targetId).emit('answer', {
       fromId: socket.id,
@@ -70,7 +63,6 @@ io.on('connection', (socket) => {
     });
   });
 
-  // WebRTC signaling: ICE candidate
   socket.on('ice-candidate', ({ targetId, candidate }) => {
     io.to(targetId).emit('ice-candidate', {
       fromId: socket.id,
@@ -78,21 +70,44 @@ io.on('connection', (socket) => {
     });
   });
 
-  // Media state toggle (mic / camera)
   socket.on('media-state', ({ micOn, cameraOn }) => {
     const roomId = socket.roomId;
     if (roomId && rooms[roomId] && rooms[roomId][socket.id]) {
       rooms[roomId][socket.id].micOn = micOn;
       rooms[roomId][socket.id].cameraOn = cameraOn;
     }
-    socket.to(socket.roomId).emit('peer-media-state', {
+    socket.to(roomId).emit('peer-media-state', {
       peerId: socket.id,
       micOn,
       cameraOn
     });
   });
 
-  // Disconnect
+  // ── Screen share signaling ──────────────────────────────────────────────
+  // BUG FIX: server MUST forward these events to room peers so receivers
+  // can populate state.peerScreenStreams[peerId] before ontrack fires.
+  // Without this, ontrack never knows the incoming stream is a screen share
+  // and attaches it to the camera tile instead of creating a new screen tile.
+
+  socket.on('screen-share-started', ({ streamId }) => {
+    socket.to(socket.roomId).emit('peer-screen-share', {
+      peerId: socket.id,
+      streamId,
+      sharing: true,
+    });
+    console.log(`[~] ${socket.userName} started screen share (stream: ${streamId})`);
+  });
+
+  socket.on('screen-share-stopped', () => {
+    socket.to(socket.roomId).emit('peer-screen-share', {
+      peerId: socket.id,
+      streamId: null,
+      sharing: false,
+    });
+    console.log(`[~] ${socket.userName} stopped screen share`);
+  });
+  // ───────────────────────────────────────────────────────────────────────
+
   socket.on('disconnect', () => {
     const roomId = socket.roomId;
     if (roomId && rooms[roomId]) {

@@ -1,13 +1,5 @@
 /* ══════════════════════════════════════════
    NexMeet — WebRTC Conference App
-   Fixes:
-   - createPeerConnection now properly tracked (isInitiatorForPeer works)
-   - onnegotiationneeded fires for ALL peers, not just initiators
-   - makingOffer guard checked BEFORE createOffer (not after)
-   - isPolite logic corrected (was inverted)
-   - peer-screen-share tile removal uses correct tile ID
-   - Screen share: high-quality constraints + high RTP priority
-   - triggerRenegotiation removed (onnegotiationneeded handles all sides)
    ══════════════════════════════════════════ */
 
 const socket = io();
@@ -26,14 +18,16 @@ const state = {
   peers: {},
   peerNames: {},
   peerMedia: {},
-  peerScreenStreams: {},   // peerId -> streamId of their screen stream
+  // peerId -> { streamId, stream }
+  // Populated when we receive peer-screen-share signal (may arrive before or after ontrack)
+  peerScreenInfo: {},
+  pendingStreams: {},   // peerId -> { streamId -> MediaStream } buffered before signal
   startTime: null,
   timerInterval: null,
-  makingOffer: {},         // peerId -> bool  (perfect negotiation)
-  ignoreOffer: {},         // peerId -> bool
+  makingOffer: {},
+  ignoreOffer: {},
 };
 
-// Track which peers WE initiated — used for polite/impolite role
 const initiatedPeers = new Set();
 
 const ICE_CONFIG = {
@@ -230,7 +224,7 @@ socket.on('room-peers', async ({ peers }) => {
   for (const peer of peers) {
     state.peerNames[peer.id] = peer.name;
     state.peerMedia[peer.id] = { micOn: peer.micOn, cameraOn: peer.cameraOn };
-    await createPeerConnection(peer.id, true);  // we initiate toward existing peers
+    await createPeerConnection(peer.id, true);
   }
 });
 
@@ -238,22 +232,16 @@ socket.on('peer-joined', ({ peerId, name, micOn, cameraOn }) => {
   state.peerNames[peerId] = name;
   state.peerMedia[peerId] = { micOn, cameraOn };
   showToast(`${name} joined`);
-  // New peer sends us an offer — PC is created lazily in the offer handler
 });
 
-// ─── Perfect Negotiation: offer handler ───────────────────────────────────
 socket.on('offer', async ({ fromId, fromName, offer, isPolite: senderIsPolite }) => {
   if (!state.peers[fromId]) {
     state.peerNames[fromId] = fromName;
-    await createPeerConnection(fromId, false);  // they initiated, we didn't
+    await createPeerConnection(fromId, false);
   }
 
   const pc = state.peers[fromId];
   const offerCollision = (pc.signalingState !== 'stable') || state.makingOffer[fromId];
-
-  // FIX: senderIsPolite tells us about THEM.
-  // If they are polite, WE are the impolite side (we were the initiator).
-  // If they are impolite, WE are the polite side.
   const weArePolite = !senderIsPolite;
 
   state.ignoreOffer[fromId] = !weArePolite && offerCollision;
@@ -264,7 +252,6 @@ socket.on('offer', async ({ fromId, fromName, offer, isPolite: senderIsPolite })
 
   try {
     if (offerCollision && weArePolite) {
-      // Polite side: roll back our pending local offer
       await pc.setLocalDescription({ type: 'rollback' });
     }
     await pc.setRemoteDescription(new RTCSessionDescription(offer));
@@ -305,13 +292,36 @@ socket.on('peer-media-state', ({ peerId, micOn, cameraOn }) => {
   updateTileBadges(peerId, micOn, cameraOn);
 });
 
-// Server tells existing peers about a new screen share stream ID
+// ── Screen share signal from server ────────────────────────────────────────
+// BUG FIX: This event was emitted by the sharer but the server never
+// forwarded it, so receivers never knew which stream ID was the screen.
+// Now the server forwards it and we store it in state.peerScreenInfo.
+//
+// RACE CONDITION FIX: The signal and the WebRTC track (ontrack) can arrive
+// in either order depending on network timing:
+//   - Signal first → store streamId, ontrack uses it to create screen tile ✓
+//   - Track first  → ontrack stores the stream, signal triggers tile creation ✓
 socket.on('peer-screen-share', ({ peerId, streamId, sharing }) => {
   if (sharing) {
-    state.peerScreenStreams[peerId] = streamId;
+    // Record that this peer is sharing streamId
+    state.peerScreenInfo[peerId] = { streamId, stream: null };
+
+    // Check if ontrack already buffered this stream (track arrived before signal)
+    const buffered = state.pendingStreams[peerId]?.[streamId];
+    if (buffered) {
+      state.peerScreenInfo[peerId].stream = buffered;
+      ensureScreenTile(peerId, buffered);
+    }
+    // Otherwise ontrack will fire later, see the matching streamId, and call ensureScreenTile
   } else {
-    delete state.peerScreenStreams[peerId];
-    // FIX: correct tile ID format — tile element id is `tile-screen-${peerId}`
+    // Sharer stopped — clean up
+    delete state.peerScreenInfo[peerId];
+    if (state.pendingStreams[peerId]) {
+      // Clear any buffered screen stream so it doesn't ghost on next share
+      Object.keys(state.pendingStreams[peerId]).forEach(sid => {
+        delete state.pendingStreams[peerId][sid];
+      });
+    }
     const tile = $(`tile-screen-${peerId}`);
     if (tile) tile.remove();
     updateGridClass();
@@ -324,12 +334,45 @@ socket.on('peer-left', ({ peerId }) => {
 });
 
 // ══════════════════════════════════════════
+// Screen tile helpers
+// ══════════════════════════════════════════
+
+/**
+ * Called when BOTH the signal (streamId known) AND the track (stream known)
+ * are available. Creates the screen tile if needed and always sets the stream.
+ */
+function ensureScreenTile(peerId, stream) {
+  const tileId = `screen-${peerId}`;
+  let tile = $(`tile-${tileId}`);
+
+  if (!tile) {
+    const name = state.peerNames[peerId] || 'Peer';
+    addVideoTile(tileId, name, stream, false, true);
+    tile = $(`tile-${tileId}`);
+  }
+
+  // Always (re)attach the stream — tile may exist from a prior share attempt
+  // and also hide the avatar so the video is visible
+  if (tile) {
+    const video = tile.querySelector('video');
+    if (video && video.srcObject !== stream) {
+      video.srcObject = stream;
+      video.play().catch(() => { });
+    }
+    // Screen tiles never show the avatar — hide it unconditionally
+    const avatar = tile.querySelector('.tile-avatar');
+    if (avatar) avatar.style.display = 'none';
+  }
+
+  updateGridClass();
+}
+
+// ══════════════════════════════════════════
 // RTCPeerConnection
 // ══════════════════════════════════════════
 async function createPeerConnection(peerId, isInitiator) {
   if (state.peers[peerId]) return state.peers[peerId];
 
-  // FIX: record initiator role HERE, inside the real function
   if (isInitiator) initiatedPeers.add(peerId);
 
   const pc = new RTCPeerConnection(ICE_CONFIG);
@@ -337,14 +380,12 @@ async function createPeerConnection(peerId, isInitiator) {
   state.makingOffer[peerId] = false;
   state.ignoreOffer[peerId] = false;
 
-  // Add all local camera/mic tracks
   if (state.localStream) {
     state.localStream.getTracks().forEach(track => {
       pc.addTrack(track, state.localStream);
     });
   }
 
-  // Add screen share tracks if currently sharing
   if (state.screenStream) {
     state.screenStream.getTracks().forEach(track => {
       pc.addTrack(track, state.screenStream);
@@ -355,25 +396,18 @@ async function createPeerConnection(peerId, isInitiator) {
     if (candidate) socket.emit('ice-candidate', { targetId: peerId, candidate });
   };
 
-  // FIX: onnegotiationneeded now fires for ALL peers (not just initiators).
-  // Perfect negotiation handles collision — no need to gate on isInitiator.
-  // The impolite side (initiator) wins collisions; polite side rolls back.
   pc.onnegotiationneeded = async () => {
-    // FIX: guard BEFORE createOffer, not after — prevents setting local
-    // description on a non-stable peer and corrupting signaling state
     if (pc.signalingState !== 'stable') return;
     if (state.makingOffer[peerId]) return;
 
     try {
       state.makingOffer[peerId] = true;
       const offer = await pc.createOffer();
-      // Double-check still stable after the async createOffer
       if (pc.signalingState !== 'stable') return;
       await pc.setLocalDescription(offer);
       socket.emit('offer', {
         targetId: peerId,
         offer,
-        // isInitiator == impolite (never backs down on collision)
         isPolite: !isInitiator,
       });
     } catch (e) {
@@ -383,35 +417,47 @@ async function createPeerConnection(peerId, isInitiator) {
     }
   };
 
-  // ─── ontrack: distinguish camera vs screen streams ────────────────────
-  pc.ontrack = ({ track, streams }) => {
+  // ─── ontrack ───────────────────────────────────────────────────────────
+  // Every incoming stream is stored in state.pendingStreams[peerId][stream.id].
+  // When peer-screen-share signal arrives with a streamId, we look up the
+  // buffered stream and call ensureScreenTile. This avoids ALL heuristics
+  // (track count, audio presence) which are unreliable on mobile browsers.
+  pc.ontrack = ({ streams }) => {
     const stream = streams[0];
     if (!stream) return;
 
-    const name = state.peerNames[peerId] || 'Peer';
-    const media = state.peerMedia[peerId] || { micOn: true, cameraOn: true };
+    // Buffer every stream by its id — the signal handler resolves which is screen
+    if (!state.pendingStreams[peerId]) state.pendingStreams[peerId] = {};
+    state.pendingStreams[peerId][stream.id] = stream;
 
-    const isScreen = state.peerScreenStreams[peerId] === stream.id;
-    const tileId = isScreen ? `screen-${peerId}` : peerId;
-
-    let tile = document.getElementById(`tile-${tileId}`);
-    if (!tile) {
-      addVideoTile(tileId, name, null, false, isScreen);
-      tile = document.getElementById(`tile-${tileId}`);
+    // Case A: peer-screen-share signal already arrived for this stream
+    const info = state.peerScreenInfo[peerId];
+    if (info && info.streamId === stream.id) {
+      info.stream = stream;
+      ensureScreenTile(peerId, stream);
+      return;
     }
 
-    if (tile) {
-      const video = tile.querySelector('video');
-      if (video && video.srcObject !== stream) {
-        video.srcObject = stream;
-        video.play().catch(() => { });
+    // Case B: peer has no camera tile yet — first stream is camera/mic
+    const existingCameraTile = $(`tile-${peerId}`);
+    if (!existingCameraTile) {
+      const name = state.peerNames[peerId] || 'Peer';
+      const media = state.peerMedia[peerId] || { micOn: true, cameraOn: true };
+      addVideoTile(peerId, name, null, false, false);
+      const tile = $(`tile-${peerId}`);
+      if (tile) {
+        const video = tile.querySelector('video');
+        if (video) { video.srcObject = stream; video.play().catch(() => { }); }
+        const avatar = tile.querySelector('.tile-avatar');
+        if (avatar) avatar.style.display = 'none';
       }
+      updateTileBadges(peerId, media.micOn, media.cameraOn);
+      updateGridClass();
+      return;
     }
 
-    if (!isScreen) {
-      updateTileBadges(peerId, media.micOn, media.cameraOn);
-    }
-    updateGridClass();
+    // Case C: camera tile exists and this stream doesn't match a known screen signal yet.
+    // It's already buffered above — peer-screen-share handler will pick it up.
   };
 
   pc.onconnectionstatechange = () => {
@@ -432,7 +478,8 @@ function removePeer(peerId) {
   initiatedPeers.delete(peerId);
   delete state.peerNames[peerId];
   delete state.peerMedia[peerId];
-  delete state.peerScreenStreams[peerId];
+  delete state.peerScreenInfo[peerId];
+  delete state.pendingStreams[peerId];
   delete state.makingOffer[peerId];
   delete state.ignoreOffer[peerId];
 
@@ -445,11 +492,6 @@ function removePeer(peerId) {
 
 // ══════════════════════════════════════════
 // SCREEN SHARE
-// Smooth, low-latency screen sharing:
-// - High framerate constraints (30fps target)
-// - RTP encoding priority set to 'high'
-// - onnegotiationneeded handles renegotiation automatically
-//   for both initiator and non-initiator sides
 // ══════════════════════════════════════════
 $('btn-share').addEventListener('click', async () => {
   if (state.isSharing) {
@@ -463,12 +505,10 @@ async function startScreenShare() {
   try {
     const screenStream = await navigator.mediaDevices.getDisplayMedia({
       video: {
-        // Higher framerate = smoother screen share
         frameRate: { ideal: 30, max: 60 },
         width: { ideal: 1920, max: 2560 },
         height: { ideal: 1080, max: 1440 },
         cursor: 'always',
-        // Prefer motion clarity over still-frame sharpness (reduces jank)
         displaySurface: 'monitor',
       },
       audio: false,
@@ -479,27 +519,21 @@ async function startScreenShare() {
 
     const screenTrack = screenStream.getVideoTracks()[0];
 
-    // Show local screen tile
     addVideoTile('screen-local', `${state.userName}'s Screen`, screenStream, true, true);
 
-    // Tell ALL remote peers the stream ID so ontrack can identify it
+    // Emit BEFORE adding tracks so receivers register the streamId before
+    // the renegotiated offer+track arrives (reduces race window)
     socket.emit('screen-share-started', { streamId: screenStream.id });
 
-    // Add screen track to every peer connection.
-    // onnegotiationneeded fires automatically on both sides (fixed),
-    // so no manual renegotiation call needed.
     for (const [peerId, pc] of Object.entries(state.peers)) {
       try {
         const sender = pc.addTrack(screenTrack, screenStream);
 
-        // FIX: set high RTP priority so screen share isn't throttled
-        // behind camera/audio tracks — reduces jank and delay
         const params = sender.getParameters();
         if (params.encodings && params.encodings.length > 0) {
           params.encodings.forEach(enc => {
             enc.priority = 'high';
             enc.networkPriority = 'high';
-            // Remove any artificially low bitrate cap
             delete enc.maxBitrate;
           });
           await sender.setParameters(params).catch(() => { });
@@ -520,7 +554,6 @@ async function startScreenShare() {
 async function stopScreenShare() {
   if (!state.screenStream) return;
 
-  // Remove screen tracks from all peer connections
   for (const pc of Object.values(state.peers)) {
     const senders = pc.getSenders().filter(s =>
       s.track && state.screenStream.getTracks().includes(s.track)
@@ -585,15 +618,21 @@ function addVideoTile(id, name, stream, isLocal, isScreen = false) {
   `;
 
   const video = tile.querySelector('video');
+  const avatar = tile.querySelector('.tile-avatar');
+
   if (stream) {
     video.srcObject = stream;
     video.play().catch(() => { });
+    // Hide the avatar whenever we already have a live stream at creation time
+    // (covers screen tiles and remote camera tiles with stream known upfront)
+    if (avatar) avatar.style.display = 'none';
   }
 
   grid.appendChild(tile);
   updateGridClass();
 
   if (isLocal && !isScreen) {
+    // Local tile: let camera state control the avatar
     updateLocalTileAvatar(tile, state.cameraOn);
     updateTileBadges('local', state.micOn, state.cameraOn);
   }
@@ -689,10 +728,6 @@ async function toggleTileFullscreen(id) {
   try {
     if (screen.orientation && screen.orientation.lock) {
       await screen.orientation.lock('landscape');
-    } else if (window.screen.lockOrientation) {
-      window.screen.lockOrientation('landscape');
-    } else if (window.screen.mozLockOrientation) {
-      window.screen.mozLockOrientation('landscape');
     }
   } catch (e) { }
 }
