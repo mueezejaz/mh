@@ -4,17 +4,12 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <!-- Enable fullscreen / standalone mode on iOS -->
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-
-  <!-- Enable fullscreen on Android Chrome -->
   <meta name="mobile-web-app-capable" content="yes">
-
-  <!-- Prevent double-tap zoom and ensure correct touch sizing -->
   <meta name="viewport"
     content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-  <title>meetLink— Video Conference</title>
+  <title>meetLink — Video Conference</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link
     href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=Syne:wght@700;800&display=swap"
@@ -139,7 +134,7 @@
     <footer class="ctrl-bar">
       <div class="ctrl-group">
 
-        <!-- Mic + picker chevron combo -->
+        <!-- Mic + device picker chevron combo -->
         <div class="ctrl-combo">
           <button id="btn-mic" class="ctrl-btn active" title="Toggle Microphone">
             <svg class="ic-mic" viewBox="0 0 24 24">
@@ -157,7 +152,8 @@
             </svg>
             <span class="ctrl-label" id="mic-label">Mute</span>
           </button>
-          <button id="btn-mic-picker" class="ctrl-chevron" title="Select microphone">
+          <!-- Updated: now opens mic + speaker picker -->
+          <button id="btn-mic-picker" class="ctrl-chevron" title="Audio devices">
             <svg viewBox="0 0 24 24">
               <polyline points="6 9 12 15 18 9" />
             </svg>
@@ -207,20 +203,9 @@
       </button>
     </footer>
 
-    <!-- Mic picker popup (floats above ctrl-bar) -->
-    <div id="mic-picker" class="mic-picker hidden">
-      <div class="mic-picker-header">
-        <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" fill="none" stroke-width="2"
-          stroke-linecap="round" stroke-linejoin="round">
-          <path d="M12 1a4 4 0 0 1 4 4v7a4 4 0 0 1-8 0V5a4 4 0 0 1 4-4z" />
-          <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-          <line x1="12" y1="19" x2="12" y2="23" />
-          <line x1="8" y1="23" x2="16" y2="23" />
-        </svg>
-        Select Microphone
-      </div>
-      <ul id="mic-list" class="mic-list"></ul>
-    </div>
+    <!-- Device Picker popup (Mic + Speaker tabs) -->
+    <div id="device-picker" class="device-picker hidden"></div>
+
   </div>
 
   <!-- Toast -->

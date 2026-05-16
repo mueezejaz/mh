@@ -14,14 +14,14 @@ const state = {
   micOn: true,
   cameraOn: true,
   selectedMicId: null,
+  selectedSpeakerId: null,
   audioDevices: [],
+  outputDevices: [],
   peers: {},
   peerNames: {},
   peerMedia: {},
-  // peerId -> { streamId, stream }
-  // Populated when we receive peer-screen-share signal (may arrive before or after ontrack)
   peerScreenInfo: {},
-  pendingStreams: {},   // peerId -> { streamId -> MediaStream } buffered before signal
+  pendingStreams: {},
   startTime: null,
   timerInterval: null,
   makingOffer: {},
@@ -48,6 +48,101 @@ function showScreen(name) {
   Object.entries(screens).forEach(([k, el]) => {
     el.classList.toggle('active', k === name);
   });
+}
+
+// ══════════════════════════════════════════
+// MEDIA ACCESS — with proper error handling
+// ══════════════════════════════════════════
+
+/**
+ * Request camera + mic with graceful fallback:
+ * 1. Try video + audio
+ * 2. If denied/unavailable, try audio only
+ * 3. If audio fails too, return null stream and flag both off
+ */
+async function requestMediaStream(videoEnabled = true, audioEnabled = true, micDeviceId = null) {
+  const audioConstraint = micDeviceId
+    ? { deviceId: { exact: micDeviceId }, echoCancellation: true, noiseSuppression: true }
+    : { echoCancellation: true, noiseSuppression: true };
+
+  // First attempt: what the user wants
+  if (videoEnabled && audioEnabled) {
+    try {
+      return await navigator.mediaDevices.getUserMedia({ video: true, audio: audioConstraint });
+    } catch (e) {
+      console.warn('Video+Audio failed:', e.name, e.message);
+    }
+  }
+
+  // Try video only
+  if (videoEnabled && !audioEnabled) {
+    try {
+      const s = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      state.micOn = false;
+      return s;
+    } catch (e) {
+      console.warn('Video only failed:', e.name);
+    }
+  }
+
+  // Try audio only (camera unavailable/denied)
+  if (audioEnabled) {
+    try {
+      const s = await navigator.mediaDevices.getUserMedia({ video: false, audio: audioConstraint });
+      state.cameraOn = false;
+      showToast('Camera unavailable — audio only');
+      return s;
+    } catch (e) {
+      console.warn('Audio only failed:', e.name, e.message);
+      if (e.name === 'NotAllowedError' || e.name === 'PermissionDeniedError') {
+        showPermissionError();
+      } else if (e.name === 'NotFoundError') {
+        showToast('No camera or microphone found');
+      } else {
+        showToast('Media access failed: ' + e.message);
+      }
+    }
+  }
+
+  state.cameraOn = false;
+  state.micOn = false;
+  return null;
+}
+
+function showPermissionError() {
+  const isChrome = /Chrome/.test(navigator.userAgent) && /Google Inc/.test(navigator.vendor);
+  const isFirefox = navigator.userAgent.includes('Firefox');
+  let msg = 'Camera/mic permission denied.';
+  if (isChrome) msg += ' Click the 🔒 icon in the address bar → Allow camera and microphone.';
+  else if (isFirefox) msg += ' Click the camera icon in the address bar to grant permission.';
+  else msg += ' Please allow camera and microphone access in your browser settings.';
+  showModal('Permission Required', msg);
+}
+
+function showModal(title, message) {
+  // Remove any existing modal
+  const existing = document.getElementById('perm-modal');
+  if (existing) existing.remove();
+
+  const modal = document.createElement('div');
+  modal.id = 'perm-modal';
+  modal.style.cssText = `
+    position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;
+    background:rgba(0,0,0,0.7);backdrop-filter:blur(8px);
+  `;
+  modal.innerHTML = `
+    <div style="background:#111418;border:1px solid rgba(255,255,255,0.12);border-radius:16px;
+      padding:32px;max-width:400px;width:90%;text-align:center;box-shadow:0 24px 64px rgba(0,0,0,0.6)">
+      <div style="font-size:40px;margin-bottom:12px">🎥</div>
+      <h3 style="font-family:'Syne',sans-serif;font-size:20px;color:#e8edf5;margin-bottom:12px">${title}</h3>
+      <p style="color:#9ca3af;font-size:14px;line-height:1.6;margin-bottom:24px">${message}</p>
+      <button onclick="document.getElementById('perm-modal').remove()" style="
+        padding:12px 28px;background:#00e5c0;border:none;border-radius:8px;
+        color:#0a0c0f;font-weight:600;font-size:14px;cursor:pointer;font-family:'DM Sans',sans-serif
+      ">Got it</button>
+    </div>
+  `;
+  document.body.appendChild(modal);
 }
 
 // ══════════════════════════════════════════
@@ -100,31 +195,25 @@ async function startPreviewStream(micDeviceId = null) {
     state.localStream.getTracks().forEach(t => t.stop());
     state.localStream = null;
   }
-  try {
-    const audioConstraint = micDeviceId
-      ? { deviceId: { exact: micDeviceId } }
-      : true;
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: true,
-      audio: audioConstraint,
-    });
-    state.localStream = stream;
+
+  const stream = await requestMediaStream(state.cameraOn, state.micOn, micDeviceId);
+  state.localStream = stream;
+
+  if (stream) {
     $('preview-video').srcObject = stream;
     stream.getAudioTracks().forEach(t => t.enabled = state.micOn);
     stream.getVideoTracks().forEach(t => t.enabled = state.cameraOn);
-    updatePrejoinUI();
-  } catch (e) {
-    showToast('Could not access camera/mic: ' + e.message);
-    state.cameraOn = false;
-    state.micOn = false;
-    updatePrejoinUI();
   }
+  updatePrejoinUI();
 }
 
 async function populateMicDevices(selectId) {
   try {
+    // Must request permission first so labels are populated
     const devices = await navigator.mediaDevices.enumerateDevices();
     state.audioDevices = devices.filter(d => d.kind === 'audioinput');
+    state.outputDevices = devices.filter(d => d.kind === 'audiooutput');
+
     const sel = $(selectId);
     if (!sel) return;
     sel.innerHTML = '';
@@ -139,8 +228,8 @@ async function populateMicDevices(selectId) {
       if (d.deviceId === state.selectedMicId) opt.selected = true;
       sel.appendChild(opt);
     });
-    if (!state.selectedMicId) {
-      state.selectedMicId = state.audioDevices[0]?.deviceId || null;
+    if (!state.selectedMicId && state.audioDevices.length > 0) {
+      state.selectedMicId = state.audioDevices[0].deviceId;
     }
   } catch (e) {
     console.warn('Could not enumerate devices:', e);
@@ -189,24 +278,34 @@ $('pj-enter').addEventListener('click', () => joinConference());
 // ══════════════════════════════════════════
 async function joinConference() {
   if (!state.localStream) {
-    try {
-      const audioConstraint = state.selectedMicId
-        ? { deviceId: { exact: state.selectedMicId } }
-        : true;
-      state.localStream = await navigator.mediaDevices.getUserMedia({
-        video: true, audio: audioConstraint,
-      });
-    } catch (e) {
-      showToast('No media devices — joining without A/V');
-    }
+    state.localStream = await requestMediaStream(state.cameraOn, state.micOn, state.selectedMicId);
+  }
+
+  // If stream has no video tracks, camera is definitively off
+  if (!state.localStream || state.localStream.getVideoTracks().length === 0) {
+    state.cameraOn = false;
+  }
+  // If stream has no audio tracks, mic is definitively off
+  if (!state.localStream || state.localStream.getAudioTracks().length === 0) {
+    state.micOn = false;
   }
 
   showScreen('conference');
   $('conf-room-id').textContent = state.roomId;
   addVideoTile('local', state.userName, state.localStream, true);
   updateGridClass();
+
+  // Sync control bar and tile badges to actual state immediately
+  updateControlBar();
+  updateTileBadges('local', state.micOn, state.cameraOn);
+  const localTile = $('tile-local');
+  if (localTile) updateLocalTileAvatar(localTile, state.cameraOn);
+
   state.startTime = Date.now();
   state.timerInterval = setInterval(updateTimer, 1000);
+
+  // Re-enumerate devices now that we have permission (labels should be populated)
+  await refreshAllDevices();
 
   socket.emit('join-room', {
     roomId: state.roomId,
@@ -214,6 +313,28 @@ async function joinConference() {
     micOn: state.micOn,
     cameraOn: state.cameraOn,
   });
+}
+
+// ══════════════════════════════════════════
+// DEVICE MANAGEMENT (used during call)
+// ══════════════════════════════════════════
+
+async function refreshAllDevices() {
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    state.audioDevices = devices.filter(d => d.kind === 'audioinput');
+    state.outputDevices = devices.filter(d => d.kind === 'audiooutput');
+
+    // Auto-select first if none selected yet
+    if (!state.selectedMicId && state.audioDevices.length > 0) {
+      state.selectedMicId = state.audioDevices[0].deviceId;
+    }
+    if (!state.selectedSpeakerId && state.outputDevices.length > 0) {
+      state.selectedSpeakerId = state.outputDevices[0].deviceId;
+    }
+  } catch (e) {
+    console.warn('Could not enumerate devices:', e);
+  }
 }
 
 // ══════════════════════════════════════════
@@ -245,10 +366,7 @@ socket.on('offer', async ({ fromId, fromName, offer, isPolite: senderIsPolite })
   const weArePolite = !senderIsPolite;
 
   state.ignoreOffer[fromId] = !weArePolite && offerCollision;
-  if (state.ignoreOffer[fromId]) {
-    console.log(`[negotiation] Ignoring colliding offer from ${fromId} (we are impolite)`);
-    return;
-  }
+  if (state.ignoreOffer[fromId]) return;
 
   try {
     if (offerCollision && weArePolite) {
@@ -292,32 +410,17 @@ socket.on('peer-media-state', ({ peerId, micOn, cameraOn }) => {
   updateTileBadges(peerId, micOn, cameraOn);
 });
 
-// ── Screen share signal from server ────────────────────────────────────────
-// BUG FIX: This event was emitted by the sharer but the server never
-// forwarded it, so receivers never knew which stream ID was the screen.
-// Now the server forwards it and we store it in state.peerScreenInfo.
-//
-// RACE CONDITION FIX: The signal and the WebRTC track (ontrack) can arrive
-// in either order depending on network timing:
-//   - Signal first → store streamId, ontrack uses it to create screen tile ✓
-//   - Track first  → ontrack stores the stream, signal triggers tile creation ✓
 socket.on('peer-screen-share', ({ peerId, streamId, sharing }) => {
   if (sharing) {
-    // Record that this peer is sharing streamId
     state.peerScreenInfo[peerId] = { streamId, stream: null };
-
-    // Check if ontrack already buffered this stream (track arrived before signal)
     const buffered = state.pendingStreams[peerId]?.[streamId];
     if (buffered) {
       state.peerScreenInfo[peerId].stream = buffered;
       ensureScreenTile(peerId, buffered);
     }
-    // Otherwise ontrack will fire later, see the matching streamId, and call ensureScreenTile
   } else {
-    // Sharer stopped — clean up
     delete state.peerScreenInfo[peerId];
     if (state.pendingStreams[peerId]) {
-      // Clear any buffered screen stream so it doesn't ghost on next share
       Object.keys(state.pendingStreams[peerId]).forEach(sid => {
         delete state.pendingStreams[peerId][sid];
       });
@@ -336,11 +439,6 @@ socket.on('peer-left', ({ peerId }) => {
 // ══════════════════════════════════════════
 // Screen tile helpers
 // ══════════════════════════════════════════
-
-/**
- * Called when BOTH the signal (streamId known) AND the track (stream known)
- * are available. Creates the screen tile if needed and always sets the stream.
- */
 function ensureScreenTile(peerId, stream) {
   const tileId = `screen-${peerId}`;
   let tile = $(`tile-${tileId}`);
@@ -351,15 +449,12 @@ function ensureScreenTile(peerId, stream) {
     tile = $(`tile-${tileId}`);
   }
 
-  // Always (re)attach the stream — tile may exist from a prior share attempt
-  // and also hide the avatar so the video is visible
   if (tile) {
     const video = tile.querySelector('video');
     if (video && video.srcObject !== stream) {
       video.srcObject = stream;
       video.play().catch(() => { });
     }
-    // Screen tiles never show the avatar — hide it unconditionally
     const avatar = tile.querySelector('.tile-avatar');
     if (avatar) avatar.style.display = 'none';
   }
@@ -381,15 +476,11 @@ async function createPeerConnection(peerId, isInitiator) {
   state.ignoreOffer[peerId] = false;
 
   if (state.localStream) {
-    state.localStream.getTracks().forEach(track => {
-      pc.addTrack(track, state.localStream);
-    });
+    state.localStream.getTracks().forEach(track => pc.addTrack(track, state.localStream));
   }
 
   if (state.screenStream) {
-    state.screenStream.getTracks().forEach(track => {
-      pc.addTrack(track, state.screenStream);
-    });
+    state.screenStream.getTracks().forEach(track => pc.addTrack(track, state.screenStream));
   }
 
   pc.onicecandidate = ({ candidate }) => {
@@ -405,11 +496,7 @@ async function createPeerConnection(peerId, isInitiator) {
       const offer = await pc.createOffer();
       if (pc.signalingState !== 'stable') return;
       await pc.setLocalDescription(offer);
-      socket.emit('offer', {
-        targetId: peerId,
-        offer,
-        isPolite: !isInitiator,
-      });
+      socket.emit('offer', { targetId: peerId, offer, isPolite: !isInitiator });
     } catch (e) {
       console.error('onnegotiationneeded error:', e);
     } finally {
@@ -417,20 +504,13 @@ async function createPeerConnection(peerId, isInitiator) {
     }
   };
 
-  // ─── ontrack ───────────────────────────────────────────────────────────
-  // Every incoming stream is stored in state.pendingStreams[peerId][stream.id].
-  // When peer-screen-share signal arrives with a streamId, we look up the
-  // buffered stream and call ensureScreenTile. This avoids ALL heuristics
-  // (track count, audio presence) which are unreliable on mobile browsers.
   pc.ontrack = ({ streams }) => {
     const stream = streams[0];
     if (!stream) return;
 
-    // Buffer every stream by its id — the signal handler resolves which is screen
     if (!state.pendingStreams[peerId]) state.pendingStreams[peerId] = {};
     state.pendingStreams[peerId][stream.id] = stream;
 
-    // Case A: peer-screen-share signal already arrived for this stream
     const info = state.peerScreenInfo[peerId];
     if (info && info.streamId === stream.id) {
       info.stream = stream;
@@ -438,7 +518,6 @@ async function createPeerConnection(peerId, isInitiator) {
       return;
     }
 
-    // Case B: peer has no camera tile yet — first stream is camera/mic
     const existingCameraTile = $(`tile-${peerId}`);
     if (!existingCameraTile) {
       const name = state.peerNames[peerId] || 'Peer';
@@ -450,18 +529,19 @@ async function createPeerConnection(peerId, isInitiator) {
         if (video) { video.srcObject = stream; video.play().catch(() => { }); }
         const avatar = tile.querySelector('.tile-avatar');
         if (avatar) avatar.style.display = 'none';
+
+        // Apply speaker if set
+        if (state.selectedSpeakerId && video.setSinkId) {
+          video.setSinkId(state.selectedSpeakerId).catch(() => { });
+        }
       }
       updateTileBadges(peerId, media.micOn, media.cameraOn);
       updateGridClass();
       return;
     }
-
-    // Case C: camera tile exists and this stream doesn't match a known screen signal yet.
-    // It's already buffered above — peer-screen-share handler will pick it up.
   };
 
   pc.onconnectionstatechange = () => {
-    console.log(`Peer ${peerId}: ${pc.connectionState}`);
     if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) {
       removePeer(peerId);
     }
@@ -504,13 +584,7 @@ $('btn-share').addEventListener('click', async () => {
 async function startScreenShare() {
   try {
     const screenStream = await navigator.mediaDevices.getDisplayMedia({
-      video: {
-        frameRate: { ideal: 30, max: 60 },
-        width: { ideal: 1280, max: 1280 },
-        height: { ideal: 720, max: 720 },
-        cursor: 'always',
-        displaySurface: 'monitor',
-      },
+      video: { frameRate: { ideal: 30, max: 60 }, cursor: 'always' },
       audio: false,
     });
 
@@ -518,26 +592,12 @@ async function startScreenShare() {
     state.isSharing = true;
 
     const screenTrack = screenStream.getVideoTracks()[0];
-
     addVideoTile('screen-local', `${state.userName}'s Screen`, screenStream, true, true);
-
-    // Emit BEFORE adding tracks so receivers register the streamId before
-    // the renegotiated offer+track arrives (reduces race window)
     socket.emit('screen-share-started', { streamId: screenStream.id });
 
     for (const [peerId, pc] of Object.entries(state.peers)) {
       try {
-        const sender = pc.addTrack(screenTrack, screenStream);
-
-        const params = sender.getParameters();
-        if (params.encodings && params.encodings.length > 0) {
-          params.encodings.forEach(enc => {
-            enc.priority = 'high';
-            enc.networkPriority = 'high';
-            delete enc.maxBitrate;
-          });
-          await sender.setParameters(params).catch(() => { });
-        }
+        pc.addTrack(screenTrack, screenStream);
       } catch (e) {
         console.error('Error adding screen track for peer', peerId, e);
       }
@@ -623,16 +683,18 @@ function addVideoTile(id, name, stream, isLocal, isScreen = false) {
   if (stream) {
     video.srcObject = stream;
     video.play().catch(() => { });
-    // Hide the avatar whenever we already have a live stream at creation time
-    // (covers screen tiles and remote camera tiles with stream known upfront)
     if (avatar) avatar.style.display = 'none';
+  }
+
+  // Apply selected speaker to remote video elements
+  if (!isLocal && state.selectedSpeakerId && video.setSinkId) {
+    video.setSinkId(state.selectedSpeakerId).catch(() => { });
   }
 
   grid.appendChild(tile);
   updateGridClass();
 
   if (isLocal && !isScreen) {
-    // Local tile: let camera state control the avatar
     updateLocalTileAvatar(tile, state.cameraOn);
     updateTileBadges('local', state.micOn, state.cameraOn);
   }
@@ -696,11 +758,6 @@ async function toggleTileFullscreen(id) {
         if (exitFn) await exitFn.call(document);
       } catch (e) { }
     }
-    try {
-      if (screen.orientation && screen.orientation.unlock) {
-        screen.orientation.unlock();
-      }
-    } catch (e) { }
     return;
   }
 
@@ -717,39 +774,22 @@ async function toggleTileFullscreen(id) {
       || tile.webkitRequestFullscreen
       || tile.mozRequestFullScreen
       || tile.msRequestFullscreen;
-
-    if (requestFn) {
-      await requestFn.call(tile, { navigationUI: 'hide' });
-    }
+    if (requestFn) await requestFn.call(tile, { navigationUI: 'hide' });
   } catch (e) {
     tile.classList.add('fullscreen-css');
   }
-
-  try {
-    if (screen.orientation && screen.orientation.lock) {
-      await screen.orientation.lock('landscape');
-    }
-  } catch (e) { }
 }
 
 function handleFullscreenChange() {
   const isFullscreen = !!(document.fullscreenElement || document.webkitFullscreenElement);
   if (!isFullscreen && currentFullscreen) {
     const tile = $(`tile-${currentFullscreen}`);
-    if (tile) {
-      tile.classList.remove('fullscreen-css');
-      setFullscreenIcon(tile, false);
-    }
-    try {
-      if (screen.orientation && screen.orientation.unlock) screen.orientation.unlock();
-    } catch (e) { }
+    if (tile) { tile.classList.remove('fullscreen-css'); setFullscreenIcon(tile, false); }
     currentFullscreen = null;
   }
 }
 document.addEventListener('fullscreenchange', handleFullscreenChange);
 document.addEventListener('webkitfullscreenchange', handleFullscreenChange);
-document.addEventListener('mozfullscreenchange', handleFullscreenChange);
-document.addEventListener('MSFullscreenChange', handleFullscreenChange);
 
 function setFullscreenIcon(tile, isFullscreen) {
   const btn = tile.querySelector('.tile-btn');
@@ -776,74 +816,160 @@ $('btn-mic').addEventListener('click', () => {
 });
 
 // ══════════════════════════════════════════
-// MIC PICKER POPUP
+// DEVICE PICKER POPUP (Mic + Speaker tabs)
 // ══════════════════════════════════════════
+
+let devicePickerTab = 'mic'; // 'mic' | 'speaker'
+
 $('btn-mic-picker').addEventListener('click', async (e) => {
   e.stopPropagation();
-  const picker = $('mic-picker');
-  const chevron = $('btn-mic-picker');
+  const picker = $('device-picker');
   const isOpen = !picker.classList.contains('hidden');
   if (isOpen) {
-    picker.classList.add('hidden');
-    chevron.classList.remove('open');
+    closeDevicePicker();
     return;
   }
-  await refreshMicPickerList();
-  picker.classList.remove('hidden');
-  chevron.classList.add('open');
+  devicePickerTab = 'mic';
+  await openDevicePicker();
 });
+
+function closeDevicePicker() {
+  $('device-picker').classList.add('hidden');
+  $('btn-mic-picker').classList.remove('open');
+}
+
+async function openDevicePicker() {
+  await refreshAllDevices();
+  renderDevicePicker();
+
+  const picker = $('device-picker');
+  picker.classList.remove('hidden');
+
+  // Position above the chevron button using fixed coords (picker is not inside ctrl-bar)
+  requestAnimationFrame(() => {
+    const btn = $('btn-mic-picker');
+    const btnRect = btn.getBoundingClientRect();
+    const pickerRect = picker.getBoundingClientRect();
+    const gap = 10;
+    let left = btnRect.left + btnRect.width / 2 - pickerRect.width / 2;
+    let top = btnRect.top - pickerRect.height - gap;
+    // Clamp to viewport
+    left = Math.max(8, Math.min(left, window.innerWidth - pickerRect.width - 8));
+    top = Math.max(8, top);
+    picker.style.left = left + 'px';
+    picker.style.top = top + 'px';
+  });
+
+  $('btn-mic-picker').classList.add('open');
+}
+
+
 
 document.addEventListener('click', (e) => {
-  const picker = $('mic-picker');
+  const picker = $('device-picker');
   const btn = $('btn-mic-picker');
-  if (!picker.contains(e.target) && e.target !== btn) {
-    picker.classList.add('hidden');
-    $('btn-mic-picker').classList.remove('open');
+  if (picker && !picker.contains(e.target) && e.target !== btn && !btn.contains(e.target)) {
+    closeDevicePicker();
   }
 });
 
-async function refreshMicPickerList() {
-  try {
-    const devices = await navigator.mediaDevices.enumerateDevices();
-    state.audioDevices = devices.filter(d => d.kind === 'audioinput');
-  } catch (e) { }
+function renderDevicePicker() {
+  const picker = $('device-picker');
+  const hasSpeaker = state.outputDevices.length > 0 && 'setSinkId' in HTMLMediaElement.prototype;
 
-  const list = $('mic-list');
+  picker.innerHTML = `
+    <div class="dp-tabs">
+      <button class="dp-tab ${devicePickerTab === 'mic' ? 'active' : ''}" data-tab="mic">
+        <svg viewBox="0 0 24 24" width="13" height="13" stroke="currentColor" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 1a4 4 0 0 1 4 4v7a4 4 0 0 1-8 0V5a4 4 0 0 1 4-4z"/>
+          <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+          <line x1="12" y1="19" x2="12" y2="23"/>
+          <line x1="8" y1="23" x2="16" y2="23"/>
+        </svg>
+        Microphone
+      </button>
+      ${hasSpeaker ? `
+      <button class="dp-tab ${devicePickerTab === 'speaker' ? 'active' : ''}" data-tab="speaker">
+        <svg viewBox="0 0 24 24" width="13" height="13" stroke="currentColor" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+          <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/>
+        </svg>
+        Speaker
+      </button>` : ''}
+    </div>
+    <ul class="dp-list" id="dp-device-list"></ul>
+  `;
+
+  // Tab switching
+  picker.querySelectorAll('.dp-tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+      devicePickerTab = tab.dataset.tab;
+      picker.querySelectorAll('.dp-tab').forEach(t => t.classList.remove('active'));
+      tab.classList.add('active');
+      renderDeviceList();
+    });
+  });
+
+  renderDeviceList();
+}
+
+function renderDeviceList() {
+  const list = $('dp-device-list');
+  if (!list) return;
   list.innerHTML = '';
-  if (state.audioDevices.length === 0) {
-    list.innerHTML = '<li class="mic-item" style="color:var(--muted)">No microphones found</li>';
+
+  const devices = devicePickerTab === 'mic' ? state.audioDevices : state.outputDevices;
+  const selectedId = devicePickerTab === 'mic' ? state.selectedMicId : state.selectedSpeakerId;
+
+  if (devices.length === 0) {
+    list.innerHTML = `<li class="dp-item" style="color:var(--muted);cursor:default">No devices found</li>`;
     return;
   }
-  state.audioDevices.forEach((device, i) => {
+
+  devices.forEach((device, i) => {
     const li = document.createElement('li');
-    li.className = 'mic-item' + (device.deviceId === state.selectedMicId ? ' selected' : '');
-    li.dataset.deviceId = device.deviceId;
-    const label = device.label || `Microphone ${i + 1}`;
+    const isSelected = device.deviceId === selectedId;
+    li.className = 'dp-item' + (isSelected ? ' selected' : '');
+    const label = device.label || `${devicePickerTab === 'mic' ? 'Microphone' : 'Speaker'} ${i + 1}`;
+
     li.innerHTML = `
-      <svg viewBox="0 0 24 24"><path d="M12 1a4 4 0 0 1 4 4v7a4 4 0 0 1-8 0V5a4 4 0 0 1 4-4z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
-      <span class="mic-name" title="${label}">${label}</span>
-      <div class="mic-check"></div>
+      <svg viewBox="0 0 24 24" width="15" height="15" stroke="currentColor" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        ${devicePickerTab === 'mic'
+        ? `<path d="M12 1a4 4 0 0 1 4 4v7a4 4 0 0 1-8 0V5a4 4 0 0 1 4-4z"/>
+             <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+             <line x1="12" y1="19" x2="12" y2="23"/>
+             <line x1="8" y1="23" x2="16" y2="23"/>`
+        : `<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+             <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/>`
+      }
+      </svg>
+      <span class="dp-name" title="${label}">${label}</span>
+      <div class="dp-check">${isSelected ? `<svg viewBox="0 0 24 24" width="10" height="10" stroke="currentColor" fill="none" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>` : ''}</div>
     `;
-    li.addEventListener('click', () => selectMicDevice(device.deviceId));
+
+    li.addEventListener('click', () => {
+      if (devicePickerTab === 'mic') selectMicDevice(device.deviceId);
+      else selectSpeakerDevice(device.deviceId);
+    });
+
     list.appendChild(li);
   });
 }
 
 async function selectMicDevice(deviceId) {
-  if (deviceId === state.selectedMicId) {
-    $('mic-picker').classList.add('hidden');
-    $('btn-mic-picker').classList.remove('open');
-    return;
-  }
+  if (deviceId === state.selectedMicId) { closeDevicePicker(); return; }
   state.selectedMicId = deviceId;
   showToast('Switching microphone…');
+
   try {
     const newAudioStream = await navigator.mediaDevices.getUserMedia({
-      audio: { deviceId: { exact: deviceId } }, video: false,
+      audio: { deviceId: { exact: deviceId }, echoCancellation: true, noiseSuppression: true },
+      video: false,
     });
     const newAudioTrack = newAudioStream.getAudioTracks()[0];
     if (!newAudioTrack) throw new Error('No audio track');
     newAudioTrack.enabled = state.micOn;
+
     if (state.localStream) {
       const oldTracks = state.localStream.getAudioTracks();
       oldTracks.forEach(t => { state.localStream.removeTrack(t); t.stop(); });
@@ -851,18 +977,38 @@ async function selectMicDevice(deviceId) {
     } else {
       state.localStream = newAudioStream;
     }
+
     for (const pc of Object.values(state.peers)) {
       const sender = pc.getSenders().find(s => s.track?.kind === 'audio');
       if (sender) await sender.replaceTrack(newAudioTrack);
     }
+
     const deviceName = state.audioDevices.find(d => d.deviceId === deviceId)?.label || 'Microphone';
     showToast(`Mic: ${deviceName.slice(0, 30)}`);
   } catch (e) {
-    showToast('Failed to switch microphone: ' + e.message);
+    showToast('Failed to switch mic: ' + e.message);
   }
-  await refreshMicPickerList();
-  $('mic-picker').classList.add('hidden');
-  $('btn-mic-picker').classList.remove('open');
+
+  await refreshAllDevices();
+  closeDevicePicker();
+}
+
+async function selectSpeakerDevice(deviceId) {
+  state.selectedSpeakerId = deviceId;
+  const deviceName = state.outputDevices.find(d => d.deviceId === deviceId)?.label || 'Speaker';
+
+  // Apply to all remote video elements
+  const videos = document.querySelectorAll('#video-grid .video-tile:not(.local) video');
+  let applied = 0;
+  for (const video of videos) {
+    if (video.setSinkId) {
+      try { await video.setSinkId(deviceId); applied++; } catch (e) { }
+    }
+  }
+
+  showToast(`Speaker: ${deviceName.slice(0, 30)}`);
+  await refreshAllDevices();
+  closeDevicePicker();
 }
 
 // ══════════════════════════════════════════
