@@ -506,8 +506,8 @@ async function startScreenShare() {
     const screenStream = await navigator.mediaDevices.getDisplayMedia({
       video: {
         frameRate: { ideal: 30, max: 60 },
-        width: { ideal: 1920, max: 2560 },
-        height: { ideal: 1080, max: 1440 },
+        width: { ideal: 1280, max: 1280 },
+        height: { ideal: 720, max: 720 },
         cursor: 'always',
         displaySurface: 'monitor',
       },
