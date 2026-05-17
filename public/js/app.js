@@ -41,6 +41,10 @@ const ICE_CONFIG = {
 const $ = (id) => document.getElementById(id);
 const screens = { lobby: $('lobby'), prejoin: $('prejoin'), conference: $('conference') };
 
+// ── Mobile detection ──────────────────────
+const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+const isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);
+
 // ══════════════════════════════════════════
 // Screen Management
 // ══════════════════════════════════════════
@@ -51,99 +55,80 @@ function showScreen(name) {
 }
 
 // ══════════════════════════════════════════
-// MEDIA ACCESS — with proper error handling
+// MEDIA ACCESS — Mobile Chrome compatible
 // ══════════════════════════════════════════
 
 /**
- * Request camera + mic with graceful fallback:
- * 1. Try video + audio
- * 2. If denied/unavailable, try audio only
- * 3. If audio fails too, return null stream and flag both off
+ * Build audio constraints mobile-safe:
+ * - Never use `exact` deviceId on first attempt (mobile Chrome rejects it often)
+ * - Fall back to `ideal` if exact fails
+ * - Avoid constraint combos that mobile Chrome rejects
+ */
+function buildAudioConstraint(micDeviceId, useExact = false) {
+  const base = { echoCancellation: true, noiseSuppression: true };
+  if (!micDeviceId) return base;
+  return {
+    ...base,
+    deviceId: useExact ? { exact: micDeviceId } : { ideal: micDeviceId },
+  };
+}
+
+/**
+ * Request camera + mic with graceful fallback chain for mobile Chrome:
+ * 1. Try video + audio (with ideal deviceId, not exact)
+ * 2. If that fails, try without echoCancellation/noiseSuppression (mobile sometimes rejects)
+ * 3. Try audio only
+ * 4. Return null and flag both off
  */
 async function requestMediaStream(videoEnabled = true, audioEnabled = true, micDeviceId = null) {
   const audioConstraint = micDeviceId
     ? { deviceId: { exact: micDeviceId }, echoCancellation: true, noiseSuppression: true }
     : { echoCancellation: true, noiseSuppression: true };
 
-  // First attempt: what the user wants
-  if (videoEnabled && audioEnabled) {
-    try {
-      return await navigator.mediaDevices.getUserMedia({ video: true, audio: audioConstraint });
-    } catch (e) {
-      console.warn('Video+Audio failed:', e.name, e.message);
-    }
-  }
+  // Single call — this is what triggers the browser's native Allow/Block popup.
+  // Do NOT split into multiple try/catch calls; the browser only prompts once.
+  try {
+    return await navigator.mediaDevices.getUserMedia({
+      video: videoEnabled,
+      audio: audioEnabled ? audioConstraint : false,
+    });
+  } catch (e) {
+    console.warn('getUserMedia failed:', e.name, e.message);
 
-  // Try video only
-  if (videoEnabled && !audioEnabled) {
-    try {
-      const s = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-      state.micOn = false;
-      return s;
-    } catch (e) {
-      console.warn('Video only failed:', e.name);
-    }
-  }
-
-  // Try audio only (camera unavailable/denied)
-  if (audioEnabled) {
-    try {
-      const s = await navigator.mediaDevices.getUserMedia({ video: false, audio: audioConstraint });
+    // If user explicitly denied, don't retry — just flag both off
+    if (e.name === 'NotAllowedError' || e.name === 'PermissionDeniedError') {
       state.cameraOn = false;
-      showToast('Camera unavailable — audio only');
-      return s;
-    } catch (e) {
-      console.warn('Audio only failed:', e.name, e.message);
-      if (e.name === 'NotAllowedError' || e.name === 'PermissionDeniedError') {
-        showPermissionError();
-      } else if (e.name === 'NotFoundError') {
+      state.micOn = false;
+      showToast('Camera/mic access denied. Check browser site settings.');
+      return null;
+    }
+
+    // Camera not found — try audio only
+    if (videoEnabled && (e.name === 'NotFoundError' || e.name === 'NotReadableError')) {
+      try {
+        const s = await navigator.mediaDevices.getUserMedia({
+          video: false,
+          audio: audioEnabled ? audioConstraint : false,
+        });
+        state.cameraOn = false;
+        showToast('Camera unavailable — audio only');
+        return s;
+      } catch (e2) {
+        state.cameraOn = false;
+        state.micOn = false;
         showToast('No camera or microphone found');
-      } else {
-        showToast('Media access failed: ' + e.message);
+        return null;
       }
     }
+
+    state.cameraOn = false;
+    state.micOn = false;
+    showToast('Media access failed: ' + e.message);
+    return null;
   }
-
-  state.cameraOn = false;
-  state.micOn = false;
-  return null;
 }
 
-function showPermissionError() {
-  const isChrome = /Chrome/.test(navigator.userAgent) && /Google Inc/.test(navigator.vendor);
-  const isFirefox = navigator.userAgent.includes('Firefox');
-  let msg = 'Camera/mic permission denied.';
-  if (isChrome) msg += ' Click the 🔒 icon in the address bar → Allow camera and microphone.';
-  else if (isFirefox) msg += ' Click the camera icon in the address bar to grant permission.';
-  else msg += ' Please allow camera and microphone access in your browser settings.';
-  showModal('Permission Required', msg);
-}
 
-function showModal(title, message) {
-  // Remove any existing modal
-  const existing = document.getElementById('perm-modal');
-  if (existing) existing.remove();
-
-  const modal = document.createElement('div');
-  modal.id = 'perm-modal';
-  modal.style.cssText = `
-    position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;
-    background:rgba(0,0,0,0.7);backdrop-filter:blur(8px);
-  `;
-  modal.innerHTML = `
-    <div style="background:#111418;border:1px solid rgba(255,255,255,0.12);border-radius:16px;
-      padding:32px;max-width:400px;width:90%;text-align:center;box-shadow:0 24px 64px rgba(0,0,0,0.6)">
-      <div style="font-size:40px;margin-bottom:12px">🎥</div>
-      <h3 style="font-family:'Syne',sans-serif;font-size:20px;color:#e8edf5;margin-bottom:12px">${title}</h3>
-      <p style="color:#9ca3af;font-size:14px;line-height:1.6;margin-bottom:24px">${message}</p>
-      <button onclick="document.getElementById('perm-modal').remove()" style="
-        padding:12px 28px;background:#00e5c0;border:none;border-radius:8px;
-        color:#0a0c0f;font-weight:600;font-size:14px;cursor:pointer;font-family:'DM Sans',sans-serif
-      ">Got it</button>
-    </div>
-  `;
-  document.body.appendChild(modal);
-}
 
 // ══════════════════════════════════════════
 // LOBBY
@@ -187,29 +172,53 @@ async function enterPrejoin(name, roomId) {
   $('preview-avatar-letter').textContent = name[0].toUpperCase();
   showScreen('prejoin');
   await startPreviewStream();
+  // Populate devices AFTER we have a stream (so labels are available on mobile)
   await populateMicDevices('pj-mic-select');
 }
 
 async function startPreviewStream(micDeviceId = null) {
+  // Stop existing tracks cleanly
   if (state.localStream) {
     state.localStream.getTracks().forEach(t => t.stop());
     state.localStream = null;
+  }
+
+  // Clear the preview video srcObject first to avoid mobile Chrome holding the track
+  const previewVideo = $('preview-video');
+  if (previewVideo.srcObject) {
+    previewVideo.srcObject = null;
   }
 
   const stream = await requestMediaStream(state.cameraOn, state.micOn, micDeviceId);
   state.localStream = stream;
 
   if (stream) {
-    $('preview-video').srcObject = stream;
+    // Apply track enabled states immediately
     stream.getAudioTracks().forEach(t => t.enabled = state.micOn);
     stream.getVideoTracks().forEach(t => t.enabled = state.cameraOn);
+
+    // Assign srcObject and explicitly call play() — required on mobile Chrome
+    previewVideo.srcObject = stream;
+    try {
+      await previewVideo.play();
+    } catch (e) {
+      // Autoplay blocked; will play on next user interaction — not critical for preview
+      console.warn('[preview] play() blocked:', e.name);
+    }
+
+    // Update camera state based on what actually came back
+    if (stream.getVideoTracks().length === 0) {
+      state.cameraOn = false;
+    }
+    if (stream.getAudioTracks().length === 0) {
+      state.micOn = false;
+    }
   }
   updatePrejoinUI();
 }
 
 async function populateMicDevices(selectId) {
   try {
-    // Must request permission first so labels are populated
     const devices = await navigator.mediaDevices.enumerateDevices();
     state.audioDevices = devices.filter(d => d.kind === 'audioinput');
     state.outputDevices = devices.filter(d => d.kind === 'audiooutput');
@@ -224,6 +233,7 @@ async function populateMicDevices(selectId) {
     state.audioDevices.forEach((d, i) => {
       const opt = document.createElement('option');
       opt.value = d.deviceId;
+      // Mobile Chrome often returns empty labels for non-default devices; show fallback
       opt.textContent = d.label || `Microphone ${i + 1}`;
       if (d.deviceId === state.selectedMicId) opt.selected = true;
       sel.appendChild(opt);
@@ -253,15 +263,10 @@ function updatePrejoinUI() {
     state.localStream.getVideoTracks().forEach(t => t.enabled = state.cameraOn);
   }
 
-  if (state.cameraOn && state.localStream?.getVideoTracks().length) {
-    preview.classList.remove('hidden');
-    avatar.classList.add('hidden');
-    camOffLabel.classList.add('hidden');
-  } else {
-    preview.classList.add('hidden');
-    avatar.classList.remove('hidden');
-    camOffLabel.classList.remove('hidden');
-  }
+  const hasVideo = state.cameraOn && state.localStream?.getVideoTracks().length > 0;
+  preview.classList.toggle('hidden', !hasVideo);
+  avatar.classList.toggle('hidden', hasVideo);
+  camOffLabel.classList.toggle('hidden', hasVideo);
 }
 
 $('pj-mic-btn').addEventListener('click', () => { state.micOn = !state.micOn; updatePrejoinUI(); });
@@ -277,34 +282,52 @@ $('pj-enter').addEventListener('click', () => joinConference());
 // JOIN CONFERENCE
 // ══════════════════════════════════════════
 async function joinConference() {
-  if (!state.localStream) {
-    state.localStream = await requestMediaStream(state.cameraOn, state.micOn, state.selectedMicId);
+  // FIX: On mobile Chrome, reusing the preview stream after srcObject is set on
+  // a second <video> element often causes tracks to go silent/black.
+  // Solution: always stop the preview stream and acquire a fresh one for the call.
+  if (state.localStream) {
+    state.localStream.getTracks().forEach(t => t.stop());
+    state.localStream = null;
   }
 
-  // If stream has no video tracks, camera is definitively off
-  if (!state.localStream || state.localStream.getVideoTracks().length === 0) {
-    state.cameraOn = false;
+  // Clear preview video so mobile Chrome releases the camera/mic hardware
+  const previewVideo = $('preview-video');
+  if (previewVideo.srcObject) {
+    previewVideo.srcObject = null;
   }
-  // If stream has no audio tracks, mic is definitively off
-  if (!state.localStream || state.localStream.getAudioTracks().length === 0) {
-    state.micOn = false;
+
+  // Small delay on mobile to let the hardware fully release before re-acquiring
+  if (isMobile) {
+    await new Promise(resolve => setTimeout(resolve, 300));
   }
+
+  const stream = await requestMediaStream(state.cameraOn, state.micOn, state.selectedMicId);
+  state.localStream = stream;
+
+  // Sync state to what we actually got
+  if (!stream || stream.getVideoTracks().length === 0) state.cameraOn = false;
+  if (!stream || stream.getAudioTracks().length === 0) state.micOn = false;
 
   showScreen('conference');
   $('conf-room-id').textContent = state.roomId;
   addVideoTile('local', state.userName, state.localStream, true);
   updateGridClass();
 
-  // Sync control bar and tile badges to actual state immediately
   updateControlBar();
   updateTileBadges('local', state.micOn, state.cameraOn);
   const localTile = $('tile-local');
   if (localTile) updateLocalTileAvatar(localTile, state.cameraOn);
 
+  // FIX: On mobile, the local tile video needs an explicit play() call
+  const localVideo = localTile?.querySelector('video');
+  if (localVideo) {
+    localVideo.srcObject = state.localStream;
+    localVideo.play().catch(e => console.warn('[local video] play() failed:', e.name));
+  }
+
   state.startTime = Date.now();
   state.timerInterval = setInterval(updateTimer, 1000);
 
-  // Re-enumerate devices now that we have permission (labels should be populated)
   await refreshAllDevices();
 
   socket.emit('join-room', {
@@ -325,7 +348,6 @@ async function refreshAllDevices() {
     state.audioDevices = devices.filter(d => d.kind === 'audioinput');
     state.outputDevices = devices.filter(d => d.kind === 'audiooutput');
 
-    // Auto-select first if none selected yet
     if (!state.selectedMicId && state.audioDevices.length > 0) {
       state.selectedMicId = state.audioDevices[0].deviceId;
     }
@@ -526,12 +548,15 @@ async function createPeerConnection(peerId, isInitiator) {
       const tile = $(`tile-${peerId}`);
       if (tile) {
         const video = tile.querySelector('video');
-        if (video) { video.srcObject = stream; video.play().catch(() => { }); }
+        if (video) {
+          video.srcObject = stream;
+          // FIX: explicit play() needed on mobile Chrome for remote streams
+          video.play().catch(() => { });
+        }
         const avatar = tile.querySelector('.tile-avatar');
         if (avatar) avatar.style.display = 'none';
 
-        // Apply speaker if set
-        if (state.selectedSpeakerId && video.setSinkId) {
+        if (state.selectedSpeakerId && video && video.setSinkId) {
           video.setSinkId(state.selectedSpeakerId).catch(() => { });
         }
       }
@@ -661,7 +686,7 @@ function addVideoTile(id, name, stream, isLocal, isScreen = false) {
   const initial = name ? name[0].toUpperCase() : '?';
 
   tile.innerHTML = `
-    <video autoplay ${isLocal && !isScreen ? 'muted' : ''} playsinline></video>
+    <video autoplay ${isLocal && !isScreen ? 'muted' : ''} playsinline webkit-playsinline></video>
     <div class="tile-avatar">
       <div class="avatar-circle">${initial}</div>
       <span class="peer-name-big">${name}</span>
@@ -682,11 +707,12 @@ function addVideoTile(id, name, stream, isLocal, isScreen = false) {
 
   if (stream) {
     video.srcObject = stream;
+    // FIX: explicit play() call — critical for mobile Chrome, which doesn't
+    // always honour the `autoplay` attribute on dynamically created elements
     video.play().catch(() => { });
     if (avatar) avatar.style.display = 'none';
   }
 
-  // Apply selected speaker to remote video elements
   if (!isLocal && state.selectedSpeakerId && video.setSinkId) {
     video.setSinkId(state.selectedSpeakerId).catch(() => { });
   }
@@ -819,7 +845,7 @@ $('btn-mic').addEventListener('click', () => {
 // DEVICE PICKER POPUP (Mic + Speaker tabs)
 // ══════════════════════════════════════════
 
-let devicePickerTab = 'mic'; // 'mic' | 'speaker'
+let devicePickerTab = 'mic';
 
 $('btn-mic-picker').addEventListener('click', async (e) => {
   e.stopPropagation();
@@ -845,7 +871,6 @@ async function openDevicePicker() {
   const picker = $('device-picker');
   picker.classList.remove('hidden');
 
-  // Position above the chevron button using fixed coords (picker is not inside ctrl-bar)
   requestAnimationFrame(() => {
     const btn = $('btn-mic-picker');
     const btnRect = btn.getBoundingClientRect();
@@ -853,7 +878,6 @@ async function openDevicePicker() {
     const gap = 10;
     let left = btnRect.left + btnRect.width / 2 - pickerRect.width / 2;
     let top = btnRect.top - pickerRect.height - gap;
-    // Clamp to viewport
     left = Math.max(8, Math.min(left, window.innerWidth - pickerRect.width - 8));
     top = Math.max(8, top);
     picker.style.left = left + 'px';
@@ -862,8 +886,6 @@ async function openDevicePicker() {
 
   $('btn-mic-picker').classList.add('open');
 }
-
-
 
 document.addEventListener('click', (e) => {
   const picker = $('device-picker');
@@ -900,7 +922,6 @@ function renderDevicePicker() {
     <ul class="dp-list" id="dp-device-list"></ul>
   `;
 
-  // Tab switching
   picker.querySelectorAll('.dp-tab').forEach(tab => {
     tab.addEventListener('click', () => {
       devicePickerTab = tab.dataset.tab;
@@ -962,8 +983,9 @@ async function selectMicDevice(deviceId) {
   showToast('Switching microphone…');
 
   try {
+    // FIX: use `ideal` not `exact` for mobile Chrome compatibility
     const newAudioStream = await navigator.mediaDevices.getUserMedia({
-      audio: { deviceId: { exact: deviceId }, echoCancellation: true, noiseSuppression: true },
+      audio: { deviceId: { ideal: deviceId }, echoCancellation: true, noiseSuppression: true },
       video: false,
     });
     const newAudioTrack = newAudioStream.getAudioTracks()[0];
@@ -997,12 +1019,10 @@ async function selectSpeakerDevice(deviceId) {
   state.selectedSpeakerId = deviceId;
   const deviceName = state.outputDevices.find(d => d.deviceId === deviceId)?.label || 'Speaker';
 
-  // Apply to all remote video elements
   const videos = document.querySelectorAll('#video-grid .video-tile:not(.local) video');
-  let applied = 0;
   for (const video of videos) {
     if (video.setSinkId) {
-      try { await video.setSinkId(deviceId); applied++; } catch (e) { }
+      try { await video.setSinkId(deviceId); } catch (e) { }
     }
   }
 
