@@ -609,7 +609,12 @@ $('btn-share').addEventListener('click', async () => {
 async function startScreenShare() {
   try {
     const screenStream = await navigator.mediaDevices.getDisplayMedia({
-      video: { frameRate: { ideal: 30, max: 60 }, cursor: 'always' },
+      video: {
+        frameRate: { ideal: 24, max: 30 },
+        width: { ideal: 854, max: 854 },
+        height: { ideal: 480, max: 480 },
+        cursor: 'always'
+      },
       audio: false,
     });
 
